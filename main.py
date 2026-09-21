@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import numpy as np
 
 from data_loading import ROOT, available_datasets, load_dataset
 from pipeline import PipelineConfig, run_pipeline
+from covariance import add_covariance_arguments, covariance_config_kwargs
 from plotting import quick_report_plots
 
 
@@ -42,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-npz", default=None, type=Path)
     p.add_argument("--trial", default=0, type=int)
     p.add_argument("--channel", default=0, type=int)
+    add_covariance_arguments(p, include_timing=True)
     return p.parse_args()
 
 
@@ -76,10 +79,16 @@ def main() -> None:
         harmonic_max_harmonics=args.harmonics,
         harmonic_settling_time=args.harmonic_settling_time,
         save_npz=args.save_npz,
+        first_pulse_sample=args.first_pulse_sample,
+        **covariance_config_kwargs(args),
     )
-    result = run_pipeline(dataset, config)
+    stim_times = np.load(args.stim_times, allow_pickle=False) if args.stim_times else None
+    result = run_pipeline(dataset, config, stim_times=stim_times)
     quick_report_plots(result, args.plot_dir, trial=args.trial, channel=args.channel)
     print(f"Dataset: {dataset.name}")
+    print(f"Removal method: {config.removal_method}")
+    if config.removal_method == "covariance":
+        print(f"Neural covariance: {result.diagnostics['covariance']}")
     print(f"Shape raw -> cleaned: {result.stages['raw'].shape} -> {result.stages['cleaned'].shape}")
     print(f"Harmonic energy ratio before: {result.diagnostics['harmonic_ratio_before']:.6f}")
     print(f"Harmonic energy ratio after:  {result.diagnostics['harmonic_ratio_after']:.6f}")

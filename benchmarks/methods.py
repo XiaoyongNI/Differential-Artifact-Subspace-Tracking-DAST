@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import warnings
 import numpy as np
+from utils import concatenate_trials
+from .lrr import OnlineLRR, fit_lrr
 
 
 @dataclass
@@ -193,7 +195,12 @@ def _decomposition(x, stim_times, fs, config, use_ica):
                 if any(issubclass(w.category, ConvergenceWarning) for w in caught):
                     warnings.warn(f"ICA did not converge in trial {trial}, window [{start}:{end}]", ConvergenceWarning)
             cleaned[trial, :, start:end] = epoch-removed
-            components.append({"trial": trial, "window": (start, end), "removed_components": indices.tolist()})
+            component = {"trial": trial, "window": (start, end), "removed_components": indices.tolist()}
+            if use_ica:
+                component["removal_operator"] = ica.mixing_[:, indices] @ ica.components_[indices]
+            else:
+                component["removal_basis"] = u[:, :r].copy()
+            components.append(component)
     return BenchmarkResult(cleaned, x-cleaned, {"components": components, "skipped_degenerate_windows": skipped})
 
 
@@ -222,7 +229,40 @@ def pulse(x, stim_times=None, fs=None, config=None):
                            "artifact_definition": "input minus returned neural estimate"})
 
 
-METHODS = {"linear_interpolation": linear_interpolation, "template_subtraction": template_subtraction,
+def fit_lrr_trials(training_data, training_stim_times, fs, config=None):
+    """Offline adapter: pool artifact-period samples from explicit training trials."""
+    train = validate_signal(training_data)
+    pre, post = window_samples(fs, config or BenchmarkConfig())
+    times = pulse_times(training_stim_times, train.shape[0], train.shape[-1])
+    mask = np.zeros((train.shape[0], train.shape[-1]), dtype=bool)
+    for trial, row in enumerate(times):
+        for start, end in windows(row, train.shape[-1], pre, post):
+            mask[trial, start:end] = True
+    return fit_lrr(concatenate_trials(train), mask.ravel())
+
+
+def lrr(x, stim_times=None, fs=None, config=None, W=None):
+    """Replay trials through the one-sample API using explicitly pretrained W.
+
+    stim_times, fs and config are accepted for benchmark compatibility only.
+    No training or trigger-dependent gating happens here.
+    """
+    x = validate_signal(x)
+    if W is None:
+        raise ValueError("LRR requires pretrained W; call fit_lrr or fit_lrr_trials offline")
+    model = OnlineLRR(W)
+    if model.W.shape[0] != x.shape[1]:
+        raise ValueError("Signal and W channel counts must match")
+    cleaned = np.empty_like(x)
+    for trial in range(x.shape[0]):
+        model.reset()
+        for t in range(x.shape[-1]):
+            cleaned[trial, :, t] = model.process_sample(x[trial, :, t])
+    return BenchmarkResult(cleaned, x-cleaned, {"W": model.W,
+                           "processing": "fixed-weight sample-by-sample"})
+
+
+METHODS = {"lrr": lrr, "linear_interpolation": linear_interpolation, "template_subtraction": template_subtraction,
            "window_svd": window_svd, "window_ica": window_ica, "pulse": pulse, "low_rank_tv": pulse}
 
 

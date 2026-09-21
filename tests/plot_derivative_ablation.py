@@ -16,20 +16,19 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import welch
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from algorithms import apply_lpf_3d
-
 from data_loading import ROOT, load_dataset
 from pipeline import PipelineConfig, run_pipeline
 from plotting import set_tbme_style
 from utils import ensure_dir
-
 
 def rmse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
@@ -146,6 +145,14 @@ def plot_ablation(dataset, res_no_diff, res_diff, args: argparse.Namespace) -> P
     ch = args.channel
     fs = float(dataset.fs)
 
+    # dictionary learning's unit is mV instead of uV; convert to uV for plotting and metrics.
+    if dataset.name.startswith("dictionary"):
+        res_no_diff.stages["raw"] *= 1e3
+        res_no_diff.stages["cleaned"] *= 1e3
+        for result in res_diff.values():
+            result.stages["raw"] *= 1e3
+            result.stages["cleaned"] *= 1e3
+
     offset = max(res_diff)
     raw = res_no_diff.stages["raw"][trial, ch, offset:]
     # ERAASR's prestimulation baseline is not simultaneous ground truth.
@@ -192,7 +199,7 @@ def plot_ablation(dataset, res_no_diff, res_diff, args: argparse.Namespace) -> P
     pad = 0.08 * (ylim[1] - ylim[0] + 1e-12)
     ylim = (ylim[0] - pad, ylim[1] + pad)
 
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
     conditions = [
         ("Without time differentiation", no_diff, "#D55E00", "--"),
         ("1st-order differentiation", with_diff[1], "#0072B2", "-"),
@@ -204,10 +211,16 @@ def plot_ablation(dataset, res_no_diff, res_diff, args: argparse.Namespace) -> P
     for label, estimate, color, linestyle in conditions:
         ax.plot(t, estimate, color=color, linestyle=linestyle, linewidth=1.0, label=label)
     ax.set_ylim(*ylim)
-    ax.set_xlabel(f"Time (s)")
-    ax.set_ylabel("Amplitude (uV)")
-    fig.legend(*ax.get_legend_handles_labels(), loc="upper center",
-               ncol=3, frameon=False, bbox_to_anchor=(0.5, 0.995))
+    ax.set_xlabel(f"Time (s)", fontsize=28)
+    ax.set_ylabel(r"Amplitude ($\mu$V)", fontsize=28)
+    ax.tick_params(axis="both", labelsize=26)
+    # fig.legend(
+    # *ax.get_legend_handles_labels(),
+    # loc="upper center",
+    # ncol=3,
+    # frameon=False,
+    # bbox_to_anchor=(0.5, 0.995),
+    # fontsize=12)
     fig.subplots_adjust(top=0.78, bottom=0.18)
 
     path = out_dir / (
@@ -268,7 +281,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--artifact-scale", default=None, type=float)
     p.add_argument("--n-test", default=10, type=int,
                    help="Number of final trials to process, including learning trials (all available if fewer).")
-    p.add_argument("--trial", default=5, type=int,
+    p.add_argument("--trial", default=None, type=int,
                    help="Zero-based trial index; default is second trial, or first for single-trial data.")
     p.add_argument("--channel", default=0, type=int)
     p.add_argument("--rank", default=1, type=int)

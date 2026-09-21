@@ -1,0 +1,182 @@
+{
+  "data_root": "/home/jalali/seizure_detection/data/swec_longterm",
+  "output_dir": "results/seizure_preservation",
+  "patients": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18
+  ],
+  "seed": 20260921,
+  "target_fs": 1024,
+  "recording_seconds": 3600,
+  "split_ratios": [
+    0.6,
+    0.2,
+    0.2
+  ],
+  "seizure_group_margin_seconds": 60,
+  "split_boundary_guard_seconds": 2,
+  "two_seizure_policy": "negative_only_validation",
+  "window_seconds": 2,
+  "overlap": 0,
+  "max_windows_per_class": {
+    "train": [
+      2000,
+      null
+    ],
+    "validation": [
+      2000,
+      null
+    ],
+    "test": [
+      2000,
+      null
+    ]
+  },
+  "decoders": [
+    "EEGNet",
+    "GRU",
+    "ChronoNet"
+  ],
+  "methods": [
+    "Clean",
+    "Contaminated",
+    "DAST",
+    "SVD",
+    "ERAASR",
+    "LRR",
+    "linear_interpolation",
+    "template_subtraction"
+  ],
+  "eegnet_source": "/home/jalali/seizure_detection/models/eegnet.py",
+  "artifact_source": "/home/jalali/seizure_detection/utils/artifact_generator.py",
+  "training": {
+    "device": "auto",
+    "torch_threads": 4,
+    "batch_size": 32,
+    "epochs": 60,
+    "patience": 10,
+    "min_delta": 1e-05,
+    "learning_rates": [
+      0.001,
+      0.0003
+    ],
+    "weight_decay": 0.0001,
+    "gradient_clip": 5.0,
+    "class_weighted_loss": true,
+    "normalization_epsilon": 1e-06,
+    "eegnet": {
+      "F1": 8,
+      "D": 2,
+      "F2": 16,
+      "dropout": 0.25
+    },
+    "gru": {
+      "hidden_size": 64,
+      "layers": 2,
+      "dropout": 0.25
+    },
+    "chrononet": {
+      "filters": 32,
+      "hidden_size": 32,
+      "dropout": 0.25
+    }
+  },
+  "artifact": {
+    "high_fs": 10240,
+    "period_samples": [
+      8,
+      10,
+      12,
+      16
+    ],
+    "n_stim_channels": 1,
+    "current_range": [
+      65.0,
+      80.0
+    ],
+    "pulse_frequency_range": [
+      250,
+      450
+    ],
+    "rms_ratio_range": [
+      2.0,
+      8.0
+    ],
+    "first_pulse_seconds": [
+      0.03,
+      0.08
+    ],
+    "end_margin_seconds": 0.03,
+    "k1_mean": -0.201,
+    "k2_mean": 0.102,
+    "strip_distance": 0.1,
+    "same_strip_distance": 0.001
+  },
+  "cancellation": {
+    "dast": {
+      "preprocessing": "none",
+      "normalization": "global_per_channel",
+      "tracker": "PASTd",
+      "rank": 1,
+      "beta": 0.999,
+      "use_derivative_for_tracking": true,
+      "derivative_order": 1,
+      "adaptive_k": false,
+      "harmonic_filter": false,
+      "carry_tracker_across_trials": false,
+      "compute_ideal_u": false,
+      "removal_method": "projection"
+    },
+    "baseline": {
+      "pre_ms": 1.0,
+      "post_ms": 6.0,
+      "rank": 1,
+      "template_history": 3
+    },
+    "eraasr": {
+      "channel_rank": 1,
+      "pulse_rank": 1,
+      "omit_channels": 1,
+      "omit_pulses": 1,
+      "pca_only_omitted": false
+    },
+    "lrr": {
+      "calibration_windows": 16
+    }
+  },
+  "restoration_epsilon": 1e-06,
+  "statistics": {
+    "alpha": 0.05,
+    "correction": "holm",
+    "family": "all_decoders_baselines_and_metrics",
+    "difference_round_decimals": 12
+  },
+  "plots": {
+    "dpi": 300,
+    "patient_alpha": 0.3,
+    "width_per_decoder": 5.2,
+    "height": 4.4
+  },
+  "storage": {
+    "keep_clean_windows": false,
+    "keep_cancelled_windows": false,
+    "keep_artifacts": true
+  },
+  "samples_per_patient": null
+}

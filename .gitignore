@@ -12,3 +12,6 @@ data/
 plots/
 *.pth
 *.pt
+
+# Seizure-preservation experiment arrays/checkpoints/reports
+results/seizure_preservation*/

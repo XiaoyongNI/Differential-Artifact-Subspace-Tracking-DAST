@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from scipy.linalg import cho_factor, cho_solve
 from scipy.signal import butter, lfilter
 
 
@@ -271,6 +272,55 @@ def project_and_remove(x: np.ndarray, U: np.ndarray, rank: Optional[int] = None)
     rank = U.shape[1] if rank is None else int(rank)
     U_active = U[:, :rank]
     return x - U_active @ (U_active.T @ x)
+
+
+def covariance_aware_subspace_suppression(
+    x: np.ndarray, U: np.ndarray, Rn: np.ndarray, Rx: np.ndarray,
+    lambda_reg: float = 1.0, eps: float = 1e-6,
+) -> np.ndarray:
+    """Suppress excess artifact power using W = Rn @ solve(A, I).
+
+    x is a channel vector or channels-by-samples matrix in the same units as
+    Rn/Rx. Only the supplied (currently active) columns of U are suppressed.
+    Artifact powers are max(diag(U.T @ (Rx-Rn) @ U), 0), not U.T @ x.
+    Tiny negative covariance eigenvalues from rounding are clipped; materially
+    indefinite matrices are rejected. No orthogonalization of U is performed.
+    """
+    x, U = np.asarray(x, dtype=float), np.asarray(U, dtype=float)
+    if x.ndim not in (1, 2) or x.shape[0] == 0 or not np.isfinite(x).all():
+        raise ValueError("x must be a finite channel vector or channels-by-samples matrix")
+    channels = x.shape[0]
+    if U.ndim != 2 or U.shape[0] != channels or U.shape[1] > channels or not np.isfinite(U).all():
+        raise ValueError("U must be finite with shape (channels, active_components)")
+    if not np.isfinite(lambda_reg) or lambda_reg < 0 or not np.isfinite(eps) or eps <= 0:
+        raise ValueError("lambda_reg must be nonnegative and eps strictly positive and finite")
+
+    def checked_covariance(matrix, name):
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.shape != (channels, channels) or not np.isfinite(matrix).all():
+            raise ValueError(f"{name} must be a finite channels-by-channels covariance")
+        matrix = (matrix + matrix.T) * 0.5
+        eigenvalues, vectors = np.linalg.eigh(matrix)
+        tolerance = 1e-10 * max(1.0, float(np.max(np.abs(eigenvalues))))
+        if eigenvalues[0] < -tolerance:
+            raise ValueError(f"{name} must be positive semidefinite")
+        if eigenvalues[0] < 0:
+            matrix = (vectors * np.maximum(eigenvalues, 0)) @ vectors.T
+        return matrix
+
+    Rn = checked_covariance(Rn, "Rn")
+    Rx = checked_covariance(Rx, "Rx")
+    powers = np.maximum(np.sum(U * ((Rx - Rn) @ U), axis=0), 0.0)
+    A = Rn + lambda_reg * (U * powers) @ U.T + eps * np.eye(channels)
+    A = (A + A.T) * 0.5
+    # A is symmetric positive definite; solve A z = x, then Rn z = W x.
+    try:
+        output = Rn @ cho_solve(cho_factor(A, lower=True), x)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Covariance solve failed; increase covariance-eps for this signal scale") from exc
+    if not np.isfinite(output).all():
+        raise ValueError("Covariance suppression produced nonfinite output")
+    return output
 
 
 def build_harmonic_freqs(stim_rate: float, fs: float, max_harmonics: Optional[int] = None) -> np.ndarray:

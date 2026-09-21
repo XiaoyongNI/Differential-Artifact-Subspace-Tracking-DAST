@@ -268,3 +268,25 @@ def load_dataset(name: str, root: Path = ROOT, **kwargs) -> Dataset:
         raise ValueError(f"Unknown dataset '{name}'. Available datasets: {choices}") from exc
     return loader(root=root, **kwargs)
 
+
+# write the main file to load the datasets and print their shapes
+def main():
+    for name in available_datasets():
+        dataset = load_dataset(name)
+        print(f"Dataset: {name}")
+        print(f"  X shape: {dataset.X.shape}")
+        if dataset.y_clean is not None:
+            print(f"  y_clean shape: {dataset.y_clean.shape}")
+        if dataset.baseline is not None:
+            print(f"  baseline shape: {dataset.baseline.shape}")
+        print(f"  fs: {dataset.fs}")
+        print(f"  stim_rate: {dataset.stim_rate}")
+        if dataset.stim_channels is not None:
+            print(f"  stim_channels: {dataset.stim_channels}")
+        if dataset.metadata is not None:
+            print(f"  metadata: {dataset.metadata}")
+        print()
+
+if __name__ == "__main__":
+    main()
+

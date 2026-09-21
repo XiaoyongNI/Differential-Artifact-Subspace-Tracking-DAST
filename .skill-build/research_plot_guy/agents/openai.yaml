@@ -1,0 +1,4 @@
+interface:
+  display_name: "research_plot_guy"
+  short_description: "MATLAB and Python research plots in your style"
+  default_prompt: "Use $research_plot_guy to plot my research results with the Presentation folder's visual conventions."

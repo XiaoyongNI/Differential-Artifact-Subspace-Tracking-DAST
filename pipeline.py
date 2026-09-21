@@ -14,12 +14,14 @@ from algorithms import (
     apply_bpf_3d,
     apply_lpf_3d,
     choose_k_from_delta_ema,
+    covariance_aware_subspace_suppression,
     denormalize_channels,
     derivative_time,
     harmonic_rls_3d,
     normalize_channels,
 )
 from data_loading import Dataset
+from covariance import prepare_neural_covariance
 from utils import harmonic_energy_ratio, ideal_u1s_from_stim_geometry, subspace_angle_deg
 
 
@@ -52,6 +54,16 @@ class PipelineConfig:
     compute_ideal_u: bool = True
     save_npz: Optional[Path] = None
     extra: Dict[str, object] = field(default_factory=dict)
+    removal_method: str = "projection"
+    neural_cov_source: str = "rest"
+    covariance_lambda: float = 1.0
+    covariance_eps: float = 1e-6
+    covariance_beta: float = 0.99
+    pulse_pre_ms: float = 0.1
+    pulse_post_ms: float = 1.1
+    interpulse_middle_fraction: float = 0.5
+    interpulse_min_samples: int = 20
+    first_pulse_sample: Optional[int] = None
 
 
 @dataclass
@@ -76,7 +88,9 @@ def _select_test_trials(X: np.ndarray, y_clean: Optional[np.ndarray], n_test: Op
     return X[-n_test:].copy(), None if y_clean is None else y_clean[-n_test:].copy()
 
 
-def run_pipeline(dataset: Dataset, config: PipelineConfig) -> PipelineResult:
+def run_pipeline(dataset: Dataset, config: PipelineConfig, stim_times=None) -> PipelineResult:
+    if config.removal_method not in ("projection", "covariance"):
+        raise ValueError("removal_method must be projection or covariance")
     X_raw, y_clean = _select_test_trials(dataset.X, dataset.y_clean, config.n_test)
     fs = float(dataset.fs)
     stages: Dict[str, np.ndarray] = {"raw": X_raw}
@@ -102,7 +116,13 @@ def run_pipeline(dataset: Dataset, config: PipelineConfig) -> PipelineResult:
         X_project = X_norm
     stages["tracking_input"] = X_track
 
+    neural_cov = None
+    if config.removal_method == "covariance":
+        neural_cov = prepare_neural_covariance(dataset, config, X_pre, norm_stats, stim_times)
+
     n_trials, n_channels, n_steps = X_track.shape
+    if neural_cov is not None and (n_steps == 0 or config.derivative_order < 0):
+        raise ValueError("Covariance removal requires at least one removal sample and a nonnegative derivative order")
     X_past = np.zeros_like(X_project)
     chosen_k = np.full((n_trials, n_steps), config.rank, dtype=int)
     delta_u = np.zeros((n_trials, n_steps, config.rank), dtype=float)
@@ -114,9 +134,22 @@ def run_pipeline(dataset: Dataset, config: PipelineConfig) -> PipelineResult:
         ideal_u = ideal_u1s_from_stim_geometry(dataset.stim_channels, n_channels, rank=config.rank)
 
     angle_trace = np.full((n_trials, n_steps, config.rank), np.nan, dtype=float)
+    if neural_cov is not None:
+        neural_initial = np.zeros((n_trials, n_channels, n_channels))
+        neural_final = np.zeros_like(neural_initial)
+        mixed_final = np.zeros_like(neural_initial)
+        artifact_power = np.zeros((n_trials, n_steps, config.rank))
+        removal_offset = config.derivative_order if config.use_derivative_for_tracking else 0
 
     tracker = None
     for tr in range(n_trials):
+        if neural_cov is not None:
+            Rn = neural_cov.at(tr, removal_offset)
+            # Initialize at expected neural power to avoid zero-start bias;
+            # mixed covariance resets per trial independently of U carry-over.
+            Rx = Rn.copy() if Rn is not None else np.zeros((n_channels, n_channels))
+            if Rn is not None:
+                neural_initial[tr] = Rn
         if tracker is None or not config.carry_tracker_across_trials:
             tracker = _make_tracker(config, n_channels)
             if config.warm_start_samples > 0:
@@ -133,10 +166,29 @@ def run_pipeline(dataset: Dataset, config: PipelineConfig) -> PipelineResult:
             U = tracker.get_components()
             chosen_k[tr, t] = active_k
             u_trace[tr, t] = U
-            X_past[tr, :, t] = X_project[tr, :, t] - U[:, :active_k] @ y[:active_k]
+            if neural_cov is None:
+                X_past[tr, :, t] = X_project[tr, :, t] - U[:, :active_k] @ y[:active_k]
+            else:
+                x_t = X_project[tr, :, t]
+                Rx = config.covariance_beta * Rx + (1.0 - config.covariance_beta) * np.outer(x_t, x_t)
+                Rx = (Rx + Rx.T) * 0.5
+                Rn = neural_cov.at(tr, t + removal_offset)
+                if Rn is None:
+                    X_past[tr, :, t] = x_t
+                else:
+                    active_U = U[:, :active_k]
+                    X_past[tr, :, t] = covariance_aware_subspace_suppression(
+                        x_t, active_U, Rn, Rx, config.covariance_lambda, config.covariance_eps,
+                    )
+                    artifact_power[tr, t, :active_k] = np.maximum(
+                        np.sum(active_U * ((Rx - Rn) @ active_U), axis=0), 0.0,
+                    )
+                    neural_final[tr] = Rn
             if ideal_u is not None:
                 n_angle = min(active_k, ideal_u.shape[1])
                 angle_trace[tr, t, :n_angle] = subspace_angle_deg(U[:, :n_angle], ideal_u[:, :n_angle])
+        if neural_cov is not None:
+            mixed_final[tr] = Rx
 
     stages["after_subspace"] = X_past
     if config.harmonic_filter:
@@ -169,6 +221,14 @@ def run_pipeline(dataset: Dataset, config: PipelineConfig) -> PipelineResult:
         diagnostics["ideal_u"] = ideal_u
     if y_clean is not None:
         diagnostics["y_clean"] = y_clean[:, :, config.derivative_order:] if config.use_derivative_for_tracking else y_clean
+    if neural_cov is not None:
+        diagnostics["covariance"] = {key: value for key, value in neural_cov.diagnostics.items() if key != "safe_mask"}
+        diagnostics["neural_covariance_initial"] = neural_initial
+        diagnostics["neural_covariance_final"] = neural_final
+        diagnostics["mixed_covariance_final"] = mixed_final
+        diagnostics["artifact_power"] = artifact_power
+        if "safe_mask" in neural_cov.diagnostics:
+            diagnostics["neural_safe_mask"] = neural_cov.diagnostics["safe_mask"]
 
     result = PipelineResult(dataset=dataset, config=config, stages=stages, diagnostics=diagnostics)
     if config.save_npz is not None:
@@ -184,5 +244,13 @@ def save_result_npz(result: PipelineResult, path: str | Path) -> None:
     payload["fs"] = np.array(result.dataset.fs)
     payload["stim_rate"] = np.array(result.dataset.stim_rate)
     payload["dataset_name"] = np.array(result.dataset.name)
+    if result.config.removal_method == "covariance":
+        payload["removal_method"] = np.array("covariance")
+        payload["neural_cov_source"] = np.array(result.diagnostics["covariance"]["source"])
+        for name in ("covariance_lambda", "covariance_eps", "covariance_beta", "pulse_pre_ms", "pulse_post_ms",
+                     "interpulse_middle_fraction", "interpulse_min_samples"):
+            payload[name] = np.array(getattr(result.config, name))
+        if result.config.first_pulse_sample is not None:
+            payload["first_pulse_sample"] = np.array(result.config.first_pulse_sample)
     np.savez(path, **payload)
 

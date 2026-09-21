@@ -1,4 +1,5 @@
-"""Spatial artifact dimensionality and stability using the existing TBME loaders.
+"""
+Spatial artifact dimensionality and stability using the existing TBME loaders.
 
 Run from any directory: python plot_stable_low_dim_artifact_subspace.py --help
 Real-data estimates are pulse averages, not isolated artifact ground truth.
@@ -13,11 +14,14 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import sys
 import warnings
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import ConnectionPatch, Rectangle
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 from scipy.signal import find_peaks
@@ -27,7 +31,14 @@ from algorithms import normalize_channels
 from data_loading import ROOT, Dataset, _load_xlsx_voltage_columns, load_dataset
 from plotting import TBME_COLORS, set_tbme_style
 
-LABELS = ["Synthetic", "PBS", "ERAASR", "Dictionary learning"]
+LABELS = [
+    "PBS",
+    "ERAASR",
+    "Dictionary-2stim",
+    "Dictionary-14stim",
+    "Dictionary-4stim",
+    "Dictionary-5stim",
+]
 
 
 
@@ -213,17 +224,57 @@ def _band(values, aggregation):
     return mean, mean - sd, mean + sd
 
 
-def plot_artifact_subspace_analysis(results, output, aggregation="mean_sd", max_plot_rank=12):
+def _link_magnifier(ax, zoom):
+    """Static rectangular magnifier with one short edge-midpoint link.
+
+    Adapted from David Fernandez Prim's magnifyOnFigure.m (2009–2010),
+    Presentation/G2, using its displayLinkStyle='straight' geometry.
+    """
+    x0, x1 = zoom.get_xlim()
+    y0, y1 = zoom.get_ylim()
+    # Enlarge only the locator for legibility (at least 6% of the main axes).
+    # It marks the neighborhood; the inset ticks give the exact zoom limits.
+    min_height = .06 * np.diff(ax.get_ylim())[0]
+    y0 = min(y0, y1 - min_height)
+    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
+                           fill=False, edgecolor=".3", linewidth=.8, zorder=4))
+    source = np.array([[(x0+x1)/2, y0], [x1, (y0+y1)/2],
+                       [(x0+x1)/2, y1], [x0, (y0+y1)/2]])
+    # Only unlabeled edges are eligible, keeping the link clear of tick text.
+    target = np.array([[1, .5], [.5, 1]])
+    ax.figure.canvas.draw()
+    distances = np.sum((ax.transData.transform(source)[:, None, :]
+                        - zoom.transAxes.transform(target)[None, :, :])**2, axis=2)
+    i, j = np.unravel_index(np.argmin(distances), distances.shape)
+    ax.add_artist(ConnectionPatch(source[i], target[j], ax.transData,
+                                  zoom.transAxes, color=".3", lw=.8, zorder=3))
+
+
+def plot_artifact_subspace_analysis(
+    results,
+    output,
+    labels,
+    aggregation="mean_sd",
+    max_plot_rank=12,
+):
     set_tbme_style()
-    plt.rcParams.update({"axes.grid": False, "font.size": 8, "axes.labelsize": 8})
-    panels = [("spatial_energy", "Spatial rank, k", "Cumulative energy"),
+    plt.rcParams.update({"font.family": "serif", "mathtext.fontset": "stix",
+                         "font.size": 13, "axes.labelsize": 13,
+                         "xtick.labelsize": 13, "ytick.labelsize": 13,
+                         "axes.grid": True, "grid.alpha": .18,
+                         "grid.linewidth": .5, "lines.linewidth": 1.4,
+                         "pdf.fonttype": 42})
+    panels = [("spatial_energy", r"Spatial rank $k$", "Cumulative energy"),
               ("dominant_direction", "Recording progression (%)", "Absolute cosine"),
               ("subspace_overlap", "Recording progression (%)", "Projection overlap")]
     figures = [plt.subplots(figsize=(3.5, 3.0)) for _ in panels]
     axes = [ax for _, ax in figures]
-    zoom = axes[0].inset_axes([.51, .15, .45, .42])
-    colors = [TBME_COLORS[k] for k in ("raw", "after_subspace", "preprocessed", "normalized")]
-    for label, color in zip(LABELS, colors):
+    zoom = axes[0].inset_axes([.43, .49, .53, .30], facecolor="white")
+    zoom_lows = []
+    colors = [TBME_COLORS[k] for k in ("raw", "after_subspace", "preprocessed",
+                                      "normalized", "after_harmonic", "tracking_input")]
+    colors.append("#17becf")
+    for label, color in zip(labels, colors):
         rows = [r for r in results if r["dataset"] == label]
         if not rows:
             continue
@@ -234,33 +285,55 @@ def plot_artifact_subspace_analysis(results, output, aggregation="mean_sd", max_
         curves = np.full((len(rows), maxrank), np.nan)
         for i, r in enumerate(rows):
             curves[i, :len(r["curve"])] = r["curve"]
-        center, lo, hi = _band(curves, aggregation)
+        center, _, _ = _band(curves, aggregation)
+        zoom_lows.extend(center[:4])
         x = np.arange(1, maxrank + 1)
         for ax in (axes[0], zoom):
             ax.plot(x, center, color=color, label=legend_label)
-            ax.fill_between(x, np.clip(lo, 0, 1), np.clip(hi, 0, 1), color=color, alpha=.16)
         # Acquisition order is not elapsed wall time; keep recordings separate.
         for i, r in enumerate(rows):
             x = np.linspace(0, 100, len(r["dominant"]))
             for ax, metric in zip(axes[1:], ("dominant", "overlap")):
-                ax.plot(x, r[metric], color=color, alpha=.7, marker=".", markersize=2,
+                ax.plot(x, r[metric], color=color, alpha=.85, marker="o", markersize=3,
+                        markerfacecolor="none", markeredgewidth=.6,
                         label=legend_label if i == 0 else "_nolegend_")
     axes[0].set_xlim(1, max(4, max_plot_rank))
     axes[0].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
     axes[0].axhline(.95, color=".65", ls=":", lw=.6)
-    zoom.set(xlim=(1, 4), ylim=(.8, 1), xticks=[1, 2, 3, 4], yticks=[.8, .9, 1.])
-    zoom.tick_params(labelsize=7, pad=2)
-    zoom.axhline(.95, color=".65", ls=":", lw=.6)
-    axes[0].indicate_inset_zoom(zoom, edgecolor=".5", alpha=.5)
+    # Show the actual early-rank variation of the displayed curves.
+    finite_lows = np.asarray(zoom_lows)[np.isfinite(zoom_lows)]
+    lower = float(finite_lows.min()) if len(finite_lows) else .8
+    span = max(1 - lower, .002)
+    zoom.set(xlim=(1, 4), ylim=(max(0, lower - .12*span), 1 + .12*span),
+             xticks=[1, 2, 3, 4])
+    zoom.yaxis.set_major_locator(MaxNLocator(nbins=2))
+    zoom.ticklabel_format(axis="y", style="plain", useOffset=False)
+    zoom.tick_params(labelsize=10, pad=2, length=3)
+    for spine in zoom.spines.values():
+        spine.set_visible(True)
+        spine.set_color(".3")
+        spine.set_linewidth(.8)
+    if zoom.get_ylim()[0] <= .95:
+        zoom.axhline(.95, color=".65", ls=":", lw=.6)
     for (fig, ax), (suffix, xlabel, ylabel) in zip(figures, panels):
         ax.set(xlabel=xlabel, ylabel=ylabel, ylim=(0, 1.025))
         if ax is not axes[0]:
             ax.set_xlim(0, 100)
-            ax.set_ylim(0.98, 1.005)
-            ax.set_yticks([0.98, 0.99, 1.00])
-        fig.legend(*ax.get_legend_handles_labels(), loc="lower center", ncol=2,
-                   frameon=False, fontsize=7, columnspacing=1.)
-        fig.subplots_adjust(left=.18, right=.97, top=.96, bottom=.32)
+            values = np.concatenate([line.get_ydata() for line in ax.lines]) if ax.lines else np.array([])
+            values = values[np.isfinite(values)]
+            lower = float(values.min()) if values.size else 0.
+            upper = float(values.max()) if values.size else 1.
+            padding = .1 * max(upper - lower, .002)
+            ax.set_ylim(max(0., lower - padding), upper + padding)
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=4, min_n_ticks=3))
+            ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+        ax.set_axisbelow(True)
+        ax.legend(loc="lower left", bbox_to_anchor=(.025, .005), ncol=1,
+                  frameon=False, fontsize=9.5, handlelength=1.7,
+                  handletextpad=.6, labelspacing=.35, borderaxespad=0)
+        fig.subplots_adjust(left=.22, right=.94, top=.95, bottom=.20)
+        if ax is axes[0]:
+            _link_magnifier(ax, zoom)
         for ext in ("pdf", "png"):
             fig.savefig(output.parent / f"{output.name}_{suffix}.{ext}", dpi=600, facecolor="white")
         plt.close(fig)
@@ -273,16 +346,15 @@ def _write_csv(path, rows):
             writer.writeheader()
             writer.writerows(rows)
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT,
                         help="Project directory containing data/ (default: this script's directory)")
-    parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent / "plots/stable_low_dim_artifact_subspace")
+    parser.add_argument("--out-dir", default=Path("plots/stable_low_dim_artifact_subspace"), type=Path) 
     parser.add_argument("--datasets", nargs="+", choices=["synthetic", "pbs", "eraasr", "dictionary"], default=["synthetic", "pbs", "eraasr", "dictionary"])
-    parser.add_argument("--stim-channels", type=int, nargs="+", default=[0, 1, 2, 8])
+    parser.add_argument("--stim-channels", type=int, nargs="+", default=[0, 1, 2, 8, 9,10,16,17,18,24,25,26,84,85,86,87])
     parser.add_argument("--pbs-configurations", type=int, nargs="+", default=list(range(14)))
-    parser.add_argument("--dictionary-configurations", nargs="+", choices=["2", "4", "5", "14"], default=["2"])
+    parser.add_argument("--dictionary-configurations", nargs="+", choices=["2", "4", "5", "14"], default=["2", "14"])
     parser.add_argument("--normalization", choices=["global_per_channel", "none"], default="global_per_channel")
     parser.add_argument("--skip-unnormalized", action="store_true")
     parser.add_argument("--aggregation", choices=["mean_sd", "median_iqr"], default="mean_sd")
@@ -293,6 +365,8 @@ def main():
     parser.add_argument("--pulse-fraction", type=float, default=.8)
     parser.add_argument("--markers-json", type=Path, help="Mapping loader dataset name to per-trial zero-based pulse sample lists, relative to loader crop")
     args = parser.parse_args()
+    synthetic_label = f"Synthetic-{len(args.stim_channels)}stim"
+    plot_labels = [synthetic_label] + LABELS
     if not np.isfinite(args.window_s) or args.window_s <= 0:
         parser.error("--window-s must be finite and positive")
     jobs = []
@@ -303,7 +377,7 @@ def main():
     if "eraasr" in args.datasets:
         jobs.append(("ERAASR", "ERAASR", {}))
     if "dictionary" in args.datasets:
-        jobs.extend(("Dictionary learning", f"dictionary_{c}stim", {}) for c in args.dictionary_configurations)
+        jobs.extend((f"Dictionary-{c}stim", f"dictionary_{c}stim", {}) for c in args.dictionary_configurations)
     # Validate the smaller recordings before loading the large synthetic archive.
     jobs.sort(key=lambda job: job[0] == "Synthetic")
     markers = json.loads(args.markers_json.read_text()) if args.markers_json else {}
@@ -336,19 +410,32 @@ def main():
                                stim_rate=ds.stim_rate, extraction=method, options=options))
         for mode in modes:
             result = summarize_subspace_statistics(blocks, mode, args.rank)
-            result.update(dataset=label, recording=ds.name, normalization=mode, trials=int(ds.X.shape[0]))
+            display_label = synthetic_label if label == "Synthetic" else label
+            result.update(dataset=display_label,recording=ds.name,normalization=mode,trials=int(ds.X.shape[0]))
             results.append(result)
         del ds, blocks
+    
     for mode in modes:
-        selected = [r for r in results if r["normalization"] == mode]
-        plot_artifact_subspace_analysis(selected, args.out_dir / f"artifact_subspace_{mode}", args.aggregation, args.max_plot_rank)
+        selected = [
+            r for r in results
+            if r["normalization"] == mode
+        ]
+
+        plot_artifact_subspace_analysis(
+            results=selected,
+            output=args.out_dir / f"artifact_subspace_{mode}",
+            labels=plot_labels,
+            aggregation=args.aggregation,
+            max_plot_rank=args.max_plot_rank,
+        )
+
     _write_csv(args.out_dir / "recording_statistics.csv", [dict(dataset=r["dataset"], recording=r["recording"], normalization=r["normalization"], trials=r["trials"], **r["stats"]) for r in results])
     _write_csv(args.out_dir / "events.csv", event_rows)
     _write_csv(args.out_dir / "energy_curves.csv", [dict(recording=r["recording"], normalization=r["normalization"], rank=i+1, energy=float(e)) for r in results for i, e in enumerate(r["curve"])])
     _write_csv(args.out_dir / "window_metrics.csv", [dict(recording=r["recording"], normalization=r["normalization"], window=i+1, dominant=float(d), overlap=float(o), dominant_consecutive=float(r["dominant_consecutive"][i-1]) if i else np.nan, overlap_consecutive=float(r["overlap_consecutive"][i-1]) if i else np.nan) for r in results for i, (d, o) in enumerate(zip(r["dominant"], r["overlap"]))])
     summary = []
     for mode in modes:
-        for label in LABELS:
+        for label in plot_labels:
             rows = [r["stats"] for r in results if r["dataset"] == label and r["normalization"] == mode]
             if not rows:
                 continue
@@ -371,6 +458,7 @@ def main():
                          "Synthetic precomputed artifact model reused; manuscript Ref. [10] identity requires author verification."])
     (args.out_dir / "analysis_metadata.json").write_text(json.dumps(report, indent=2))
     print(f"Saved figures and statistics to {args.out_dir}")
+
 
 
 if __name__ == "__main__":
