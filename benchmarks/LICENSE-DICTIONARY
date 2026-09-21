@@ -1,0 +1,23 @@
+Adapted from data/dictionary-learning/+analyFunc, in particular
+template_dictionary.m, get_artifact_indices.m, get_artifacts.m, and
+template_equalize_length.m. The source README identifies the authors as
+David J. Caldwell, Jeneva A. Cronin, Rajesh P.N. Rao, Kelly L. Collins,
+Kurt E. Weaver, Andrew L. Ko, Jeffrey G. Ojemann, Nathan J. Kutz,
+and Bingni W. Brunton, and describes the project as BSD-3 licensed.
+The following notice is preserved verbatim from the adapted MATLAB functions:
+
+Copyright (c) 2018 Updated by David Caldwell
+University of Washington
+djcald at uw . edu
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+The Software is provided "as is", without warranty of any kind.
+
+The local MATLAB HDBSCAN implementation is by Jordan Sorokin (2017).
+This Python adaptation uses the separately distributed hdbscan package,
+not a copy of the MATLAB clustering implementation.

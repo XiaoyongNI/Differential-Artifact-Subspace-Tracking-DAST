@@ -19,6 +19,7 @@ from .common import write_json, write_csv, derived_seed, seed_everything, array_
 from .data import load_patient_data, split_patient_data, extract_windows
 from .training import train_eegnet, train_gru, train_chrononet, fit_normalization, evaluate_decoder
 from .cancellation import generate_synthetic_artifact, apply_artifact_cancellation, calibrate_lrr
+from .checkpoints import DATA_SETTINGS, load_patient_decoders
 from .reporting import add_restoration, aggregate_results, run_statistical_analysis, plot_results
 
 DEFAULT_CONFIG = Path(__file__).with_name('config.json')
@@ -146,25 +147,35 @@ def run_patient(patient_id, config, directory):
     print(f'{patient.patient}: splitting clean recordings before extraction', flush=True)
     groups = split_patient_data(patient, config, directory)
     cache = directory/'signals'
-    splits = {s: extract_windows(patient, groups[s], s, config, cache) for s in groups}
-    train_x, train_y = splits['train']
-    val_x, val_y = splits['validation']
-    test_x, test_y = splits['test']
+    offset = config['evaluation_offset_samples']
+    if config.get('load_decoders'):
+        models, normalization, val_y = load_patient_decoders(patient,config,directory)
+        test_x,test_y = extract_windows(patient,groups['test'],'test',config,cache)
+        source = Path(config['load_decoders'])/patient.patient/'signals'
+        if (source/'test_windows.csv').read_bytes() != (cache/'test_windows.csv').read_bytes():
+            raise ValueError('Selected test windows differ from the checkpoint run')
+        # Keep validation labels for provenance and future checkpoint reuse.
+        np.save(cache/'validation_labels.npy',val_y)
+        print(f'{patient.patient}: loaded frozen decoders; skipping training/validation signal extraction and training',flush=True)
+    else:
+        splits = {s: extract_windows(patient, groups[s], s, config, cache) for s in groups}
+        train_x,train_y = splits['train']
+        val_x,val_y = splits['validation']
+        test_x,test_y = splits['test']
+        normalization = fit_normalization(train_x,offset,config['training']['normalization_epsilon'])
+        trainers = dict(EEGNet=train_eegnet,GRU=train_gru,ChronoNet=train_chrononet)
+        models = {name:trainers[name](train_x,train_y,val_x,val_y,normalization,config,directory,patient.patient)
+                  for name in config['decoders']}
+        del splits,train_x,val_x
     if set(np.unique(test_y)) != {0,1}:
         raise ValueError(f'{patient.patient}: test set must contain both classes')
-    offset = config['evaluation_offset_samples']
-    normalization = fit_normalization(train_x, offset, config['training']['normalization_epsilon'])
-    mean, scale = normalization
-    np.savez(directory/'normalization.npz', mean=mean,scale=scale, fitted_on='clean_train_only',offset=offset)
-    # RMS from clean train only (channel moments include DC); no test scaling.
+    mean,scale = normalization
+    np.savez(directory/'normalization.npz',mean=mean,scale=scale,fitted_on='clean_train_only',offset=offset)
     train_rms = float(np.sqrt(np.mean(mean.astype(float)**2+scale.astype(float)**2)))
-    trainers = dict(EEGNet=train_eegnet,GRU=train_gru,ChronoNet=train_chrononet)
-    models = {name:trainers[name](train_x,train_y,val_x,val_y,normalization,config,directory,patient.patient)
-              for name in config['decoders']}
     # Decoder selection is complete before any test artifact is generated.
     lrr_weights = None
     if any(m in config["methods"] for m in ("LRR", "lrr")):
-        lrr_weights = calibrate_lrr(train_x.shape[1], train_x.shape[2], train_rms,
+        lrr_weights = calibrate_lrr(test_x.shape[1], test_x.shape[2], train_rms,
                                     config, patient.patient, directory)
     shape = test_x.shape
     mixed = np.lib.format.open_memmap(cache/'Contaminated.npy',mode='w+',dtype=np.float32,shape=shape)
@@ -203,7 +214,7 @@ def run_patient(patient_id, config, directory):
                 window_indices=np.arange(len(test_y)), sample_offset=offset, sampling_rate=config['target_fs'])
     add_restoration(rows,config['restoration_epsilon'])
     write_csv(directory/'results.csv',rows)
-    del splits,train_x,val_x,test_x,mixed,artifacts,outputs,models,x,clean
+    del test_x,mixed,artifacts,outputs,models,x,clean
     # Remove only regenerable caches created in this patient directory.
     for path in cache.glob('*.npy'):
         remove = (path.name.endswith('_clean.npy') and not config['storage']['keep_clean_windows'])
@@ -225,6 +236,14 @@ def run(config, resume=False, plan_only=False):
     torch.set_num_threads(config['training']['torch_threads'])
     seed_everything(config['seed'])
     directory = Path(config['output_dir']).resolve()
+    if config.get('load_decoders') and Path(config['load_decoders']).resolve() == directory:
+        raise ValueError('Checkpoint source and output must be different directories')
+    if config.get('load_decoders'):
+        config['loaded_checkpoint_hashes'] = {}
+        for patient_id in config['patients']:
+            for name in config['decoders']:
+                path = Path(config['load_decoders'])/f'ID{patient_id:02d}'/name/'best.pt'
+                config['loaded_checkpoint_hashes'][str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
     exact = dict(config, plan_only=plan_only)
     sources = source_manifest(config)
     config_file = directory/'config.json'
@@ -279,6 +298,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--output-dir',type=Path)
+    parser.add_argument('--load-decoders',type=Path,help='Prior run directory: reuse frozen best.pt checkpoints; skip decoder training')
     parser.add_argument('--patients',nargs='+',type=int)
     parser.add_argument('--samples-per-patient',type=int,help='Total window budget per patient across train/validation/test; >=6. Overrides class caps, targets balanced classes.')
     parser.add_argument('--device',choices=['auto','cpu','cuda','cuda:0','cuda:1'])
@@ -297,6 +317,15 @@ def main():
         config['training']['gru'].update(hidden_size=8,layers=1)
         config['training']['chrononet'].update(filters=4,hidden_size=8)
         config['storage'] = dict(keep_clean_windows=True,keep_cancelled_windows=True,keep_artifacts=True)
+    if args.load_decoders is not None:
+        config['load_decoders'] = str(args.load_decoders.resolve())
+    if config.get('load_decoders'):
+        if args.smoke:
+            parser.error('--smoke cannot be combined with checkpoint loading')
+        source_config = json.loads((Path(config['load_decoders'])/'config.json').read_text())
+        for key in DATA_SETTINGS:
+            config[key] = source_config.get(key)
+        config['smoke_test'] = source_config.get('smoke_test',False)
     if args.output_dir is not None:
         config['output_dir'] = str(args.output_dir)
     if args.patients is not None:

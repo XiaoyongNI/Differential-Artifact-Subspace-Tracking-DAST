@@ -6,7 +6,7 @@ from scipy.signal import welch
 
 from algorithms import (apply_lpf_3d, apply_bpf_3d,
                         covariance_aware_subspace_suppression)
-from .methods import linear_interpolation, pulse
+from .methods import linear_interpolation, pulse, low_rank_tv
 
 
 def _pearson(a, b):
@@ -95,7 +95,9 @@ def clean_rest_output(rest, method, result, config, fs, stim_times=None):
     preserve each clean window's own channel means.
     Window SVD/ICA reuse fitted components at the same relative sample windows;
     template subtraction replays the estimated template correction at those
-    positions. Interpolation uses the same hypothetical pulse positions. These
+    positions. Dictionary learning likewise replays the selected and scaled
+    stimulation correction, without learning or matching again on rest.
+    Interpolation uses the same hypothetical pulse positions. These
     are counterfactual removal tests: the rest recording has no actual pulses.
     LowRankTV has no fitted model state, so its solver runs directly on rest.
     A shared rest trial may be reused; unmatched independent trial counts cannot
@@ -132,13 +134,24 @@ def clean_rest_output(rest, method, result, config, fs, stim_times=None):
                 else:
                     output = normalized-active_U @ (active_U.T @ normalized)
             cleaned[tr] = output*scale
+    elif method == 'asar':
+        from .methods import asar_model
+        for tr in range(n_trials):
+            model = asar_model(result.diagnostics['mean'][tr], result.diagnostics['std'][tr],
+                               config, weights=result.diagnostics['weights'][tr])
+            for t in range(reference.shape[-1]):
+                cleaned[tr, :, t] = model.process_sample(reference[tr, :, t], adapt=False)
     elif method == 'lrr':
         from .methods import lrr
         cleaned = lrr(reference, W=result.diagnostics['W']).cleaned
+    elif method == 'svd_template_subtraction':
+        _, after_svd = clean_rest_output(reference, 'window_svd', result.diagnostics['svd'], config, fs)
+        _, cleaned = clean_rest_output(after_svd, 'template_subtraction',
+                                       result.diagnostics['template_subtraction'], config, fs)
     elif method == 'linear_interpolation':
         times = [np.asarray(row)[np.asarray(row) < reference.shape[-1]] for row in stim_times]
         cleaned = linear_interpolation(reference, times, fs, config).cleaned
-    elif method == 'template_subtraction':
+    elif method in ('template_subtraction', 'dictionary_learning'):
         n = min(reference.shape[-1], result.artifact.shape[-1])
         cleaned[:, :, :n] -= result.artifact[:, :, :n]
     elif method in ('window_svd', 'window_ica'):
@@ -155,8 +168,20 @@ def clean_rest_output(rest, method, result, config, fs, stim_times=None):
             else:
                 removed = component['removal_operator'] @ (epoch-epoch.mean(axis=1, keepdims=True))
             cleaned[tr, :, start:end] = epoch-removed
-    elif method in ('pulse', 'low_rank_tv'):
-        cleaned = pulse(reference, config=config).cleaned
+    elif method == 'pulse':
+        # Replay the stimulation trace/mask on rest with frozen network and
+        # training normalization; crop/zero-pad to the reference duration.
+        if reference.shape[-1] < 16:
+            return None, None
+        trace = np.zeros((n_trials, 1, reference.shape[-1]), dtype=np.float32)
+        mask = np.zeros_like(trace)
+        n = min(reference.shape[-1], result.cleaned.shape[-1])
+        trace[..., :n] = result.diagnostics['stim_trace'][..., :n]
+        mask[..., :n] = result.diagnostics['artifact_mask'][..., :n]
+        cleaned = pulse(reference, fs=fs, config=config, model=result.diagnostics['model'],
+                        stim_trace=trace, artifact_mask=mask).cleaned
+    elif method == 'low_rank_tv':
+        cleaned = low_rank_tv(reference, config=config).cleaned
     else:
         raise ValueError(f'No clean/rest evaluation for {method}')
     return reference, cleaned

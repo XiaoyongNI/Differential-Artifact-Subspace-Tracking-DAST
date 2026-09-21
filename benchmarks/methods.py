@@ -6,6 +6,7 @@ import warnings
 import numpy as np
 from utils import concatenate_trials
 from .lrr import OnlineLRR, fit_lrr
+from .asar import OnlineASAR, calibrate_asar
 
 
 @dataclass
@@ -22,6 +23,37 @@ class BenchmarkConfig:
     tol: float = 1e-4
     lambda_tv: float = 1.0
     rho: float = 1.0
+    asar_filter_length: int = 201
+    asar_mu: float = 0.1
+    asar_threshold: float = 5.0
+    asar_epsilon: float = 1e-4
+    asar_stats_samples: int = 500
+    asar_reference_channels: tuple[int, ...] | None = None
+    dictionary_min_points: int = 2
+    dictionary_min_cluster_size: int = 3
+    dictionary_outlier_threshold: float = .95
+    dictionary_bracket: int = 6
+    dictionary_baseline_samples: int = 3
+    dictionary_normalize: str = 'preAverage'
+    dictionary_match: str = 'corr'
+    dictionary_onset_threshold: float = 1.5
+    dictionary_detection_ms: float = 4.
+    dictionary_min_duration_ms: float = .5
+    dictionary_end_percentile: float = 75.
+    pulse_epochs: int = 200
+    pulse_batch_size: int = 1
+    pulse_learning_rate: float = 1e-3
+    pulse_device: str = 'auto'
+    pulse_artifact_duration_ms: float = 40.
+    pulse_blur_samples: int = 5
+    pulse_predict_neural: bool = False
+    pulse_uncertainty: bool = False
+    pulse_f_cutoff: float = 10.
+    pulse_w_cosine: float = 5.
+    pulse_w_rank_a: float = 1.5
+    pulse_w_rank_s: float = 1.
+    pulse_w_spectral: float = 1.2
+    pulse_w_spectral_slope: float = 5.
 
 
 @dataclass
@@ -103,7 +135,7 @@ def linear_interpolation(x, stim_times, fs, config=None):
     return BenchmarkResult(cleaned, x-cleaned, {"skipped_edge_windows": skipped})
 
 
-def template_subtraction(x, stim_times, fs, config=None, training_data=None, training_stim_times=None):
+def average_template_subtraction(x, stim_times, fs, config=None, training_data=None, training_stim_times=None):
     """Subtract average pulse epochs, using prior pulses or separate training data.
 
     history=None learns a fixed template from training_data (defaults to x).
@@ -214,10 +246,41 @@ def window_ica(x, stim_times, fs, config=None):
     return _decomposition(x, stim_times, fs, config or BenchmarkConfig(method="window_ica"), True)
 
 
-def pulse(x, stim_times=None, fs=None, config=None):
+def svd_template_subtraction(x, stim_times, fs, config=None,
+                             training_data=None, training_stim_times=None):
+    """Window SVD followed by average template subtraction of its residual.
+
+    Both stages reuse the same pulse windows/configuration. For fixed-template
+    fitting, separate training recordings also pass through SVD first; no raw
+    training template is subtracted from an SVD-cleaned test signal.
+    """
+    config = config or BenchmarkConfig(method='svd_template_subtraction')
+    x = validate_signal(x)
+    # Materialize once so both stages also support generator marker inputs.
+    markers = None if stim_times is None else list(stim_times)
+    times = pulse_times(markers, x.shape[0], x.shape[-1])
+    train_cleaned = None
+    train_times = None
+    if config.template_history is None and training_data is not None:
+        train = validate_signal(training_data)
+        if train.shape[1] != x.shape[1]:
+            raise ValueError('Training and test channel counts must match')
+        train_times = pulse_times(markers if training_stim_times is None else training_stim_times,
+                                  train.shape[0], train.shape[-1])
+        train_cleaned = window_svd(train, train_times, fs, config).cleaned
+    svd_result = window_svd(x, times, fs, config)
+    template_result = average_template_subtraction(
+        svd_result.cleaned, times, fs, config,
+        training_data=train_cleaned, training_stim_times=train_times)
+    return BenchmarkResult(template_result.cleaned, x-template_result.cleaned, {
+        'stage_order': ('window_svd', 'template_subtraction'),
+        'svd': svd_result, 'template_subtraction': template_result})
+
+
+def low_rank_tv(x, stim_times=None, fs=None, config=None):
     """Upstream PULSE repository's marker-free LowRankTV (not a named PULSE class)."""
     from ._pulse_low_rank_tv import LowRankTV
-    config = config or BenchmarkConfig(method="pulse")
+    config = config or BenchmarkConfig(method="low_rank_tv")
     x = validate_signal(x)
     if config.rho <= 0 or config.lambda_tv < 0 or config.max_iters < 1 or config.tol <= 0:
         raise ValueError("rho, max_iters, tol must be positive; lambda_tv nonnegative")
@@ -262,8 +325,61 @@ def lrr(x, stim_times=None, fs=None, config=None, W=None):
                            "processing": "fixed-weight sample-by-sample"})
 
 
-METHODS = {"lrr": lrr, "linear_interpolation": linear_interpolation, "template_subtraction": template_subtraction,
-           "window_svd": window_svd, "window_ica": window_ica, "pulse": pulse, "low_rank_tv": pulse}
+def asar_model(mean, std, config, weights=None):
+    """Shared construction for online cancellation and frozen rest evaluation."""
+    return OnlineASAR(mean, std, filter_length=config.asar_filter_length,
+                      mu=config.asar_mu, threshold=config.asar_threshold,
+                      epsilon=config.asar_epsilon,
+                      reference_channels=config.asar_reference_channels, weights=weights)
+
+
+def asar(x, stim_times=None, fs=None, config=None, calibration_data=None):
+    """Replay ASAR sample by sample, independently resetting each trial.
+
+    Default calibration replays the first N test samples, matching MATLAB;
+    that initialization is offline. For causal inference, provide a separate
+    preceding calibration recording, shaped (1 or n_trials, channels, time).
+    Ground truth and stimulation markers are never used.
+    """
+    config = config or BenchmarkConfig(method="asar")
+    x = validate_signal(x)
+    calibration = x if calibration_data is None else validate_signal(calibration_data)
+    if calibration.shape[0] not in (1, x.shape[0]) or calibration.shape[1] != x.shape[1]:
+        raise ValueError("Calibration must have matching channels and one or n_trials trials")
+    cleaned = np.empty_like(x)
+    means, stds, weights = [], [], []
+    for trial in range(x.shape[0]):
+        mean, std = calibrate_asar(calibration[0 if calibration.shape[0] == 1 else trial],
+                                   config.asar_stats_samples)
+        model = asar_model(mean, std, config)
+        for t in range(x.shape[-1]):
+            cleaned[trial, :, t] = model.process_sample(x[trial, :, t])
+        means.append(mean)
+        stds.append(std)
+        weights.append(model.weights)
+    return BenchmarkResult(cleaned, x-cleaned, {
+        "mean": np.stack(means), "std": np.stack(stds), "weights": np.stack(weights),
+        "reference_channels": model.reference_channels,
+        "calibration_source": "test_prefix_replay" if calibration_data is None else "provided",
+        "stats_samples": config.asar_stats_samples,
+        "output_convention": "post_update", "rest_evaluation": "frozen_weights_zero_history"})
+
+
+def pulse(x, stim_times=None, fs=None, config=None, **kwargs):
+    """PULSE U-Net inference with an explicitly trained model and stimulation trace."""
+    from .pulse_nn import pulse as apply_pulse
+    return apply_pulse(x, stim_times, fs, config, **kwargs)
+
+
+def dictionary_learning(x, stim_times=None, fs=None, config=None, **kwargs):
+    """Offline clustered artifact templates; see dictionary_learning module."""
+    from .dictionary_learning import dictionary_learning as apply_dictionary
+    return apply_dictionary(x, stim_times, fs, config, **kwargs)
+
+
+METHODS = {"dictionary_learning": dictionary_learning, "asar": asar, "lrr": lrr, "linear_interpolation": linear_interpolation, "template_subtraction": average_template_subtraction,
+           "svd_template_subtraction": svd_template_subtraction,
+           "window_svd": window_svd, "window_ica": window_ica, "pulse": pulse, "low_rank_tv": low_rank_tv}
 
 
 def run_benchmark(dataset, config=None, stim_times=None, **kwargs):

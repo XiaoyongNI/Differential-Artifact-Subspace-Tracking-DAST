@@ -2,8 +2,8 @@
 import unittest
 import warnings
 import numpy as np
-from .methods import (BenchmarkConfig, linear_interpolation, template_subtraction,
-                      window_svd, window_ica, pulse, pulse_times)
+from .methods import (BenchmarkConfig, linear_interpolation, average_template_subtraction,
+                      window_svd, window_ica, low_rank_tv, pulse_times)
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class BenchmarkTests(unittest.TestCase):
         x = np.zeros((1, 1, 20))
         for t, value in zip([2, 7, 12], [3., 5., 9.]):
             x[:, :, t:t+2] = value
-        result = template_subtraction(x, [2, 7, 12], 1000,
+        result = average_template_subtraction(x, [2, 7, 12], 1000,
                                      BenchmarkConfig(pre_ms=0, post_ms=2, template_history=2))
         np.testing.assert_allclose(result.cleaned[0, 0, [2, 7, 12]], [3, 2, 5])
         np.testing.assert_array_equal(x, result.cleaned+result.artifact)
@@ -35,7 +35,7 @@ class BenchmarkTests(unittest.TestCase):
         train[:, :, 2:4] = 7
         test = np.zeros((1, 2, 10))
         test[:, :, 5:7] = 9
-        result = template_subtraction(test, [5], 1000,
+        result = average_template_subtraction(test, [5], 1000,
                                      BenchmarkConfig(pre_ms=0, post_ms=2, template_history=None),
                                      training_data=train, training_stim_times=[2])
         np.testing.assert_allclose(result.cleaned[:, :, 5:7], 2)
@@ -61,11 +61,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertLess(np.mean((result.cleaned-expected)**2), np.mean((x-expected)**2)/100)
         np.testing.assert_allclose(result.cleaned+result.artifact, x, atol=1e-14)
 
-    def test_pulse_shape_finite_reconstruction_and_no_mutation(self):
+    def test_low_rank_tv_shape_finite_reconstruction_and_no_mutation(self):
         rng = np.random.default_rng(1)
         x = rng.normal(size=(2, 3, 40))
         original = x.copy()
-        result = pulse(x, config=BenchmarkConfig(max_iters=5))
+        result = low_rank_tv(x, config=BenchmarkConfig(max_iters=5))
         self.assertEqual(result.cleaned.shape, x.shape)
         self.assertTrue(np.isfinite(result.cleaned).all())
         np.testing.assert_allclose(result.cleaned+result.artifact, x, atol=1e-14)

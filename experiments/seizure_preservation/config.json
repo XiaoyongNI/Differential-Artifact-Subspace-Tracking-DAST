@@ -178,5 +178,6 @@
     "keep_cancelled_windows": false,
     "keep_artifacts": true
   },
-  "samples_per_patient": null
+  "samples_per_patient": null,
+  "load_decoders": null
 }

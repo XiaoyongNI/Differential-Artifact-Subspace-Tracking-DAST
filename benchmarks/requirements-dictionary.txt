@@ -1,0 +1,2 @@
+# Tested with the project's scikit-learn 1.2.2 / NumPy environment.
+hdbscan==0.8.40

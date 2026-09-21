@@ -51,6 +51,28 @@ synthetic-only calibration windows are not included in this neural-window budget
 Balanced subsampling changes test prevalence and very small test sets give
 coarse metrics; it is useful for reducing computation.
 
+To **reuse trained decoders and test cancellation without retraining**:
+
+```bash
+python -m experiments.seizure_preservation.run --device cuda:0 \
+  --load-decoders results/seizure_preservation_n100 \
+  --output-dir results/seizure_preservation_n100_retest
+```
+
+The source is a complete previous run directory containing `IDxx/DECODER/best.pt`,
+split/input manifests, and saved test-window manifests. Data/split settings,
+patient list, random seed and sample budget are inherited automatically; you
+can select a subset with `--patients 1 4`. Decoder architecture and normalization
+come from each checkpoint. All parameters and BatchNorm statistics stay frozen.
+Training and validation **signal extraction and decoder training are skipped**.
+Test windows are reloaded from HDF5 and verified against the original manifest.
+Cancellation/artifact settings come from the current `--config` (default config
+includes LRR); matching settings reproduce the same test artifacts. LRR's separate
+synthetic-only calibration still runs. Checkpoint/data/split mismatches raise an
+error and never silently retrain. Use a separate output directory; checkpoints
+are copied there with source paths and SHA-256 hashes in `loaded_decoders.json`.
+`--resume` alone skips completed patients; it is not the checkpoint-loading mode.
+
 All settings are in [config.json](config.json). CLI overrides and smoke overrides
 are saved in the exact run configuration. Choose a new output directory when
 changing configuration or code; resume verifies both configuration and source

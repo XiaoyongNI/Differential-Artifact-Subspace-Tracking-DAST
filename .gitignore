@@ -10,6 +10,7 @@ venv/
 # Data / outputs
 data/
 plots/
+paper/
 *.pth
 *.pt
 

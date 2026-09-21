@@ -104,7 +104,7 @@ def _train(name, train_x, train_y, val_x, val_y, normalization, config, output_d
             if val_loss < best_loss:
                 best_loss = val_loss
                 torch.save(dict(model={k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
-                    decoder=name, channels=train_x.shape[1], samples=train_x.shape[-1]-offset,
+                    patient=patient, decoder=name, channels=train_x.shape[1], samples=train_x.shape[-1]-offset,
                     mean=torch.from_numpy(mean), scale=torch.from_numpy(scale),
                     epoch=epoch+1, validation_loss=val_loss, learning_rate=lr, seed=seed,
                     config=config, class_weights=weights.tolist()), checkpoint)

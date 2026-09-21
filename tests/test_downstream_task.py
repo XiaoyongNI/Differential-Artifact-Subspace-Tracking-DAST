@@ -273,3 +273,43 @@ def test_invalid_patient_budget(config,limit):
     config['samples_per_patient']=limit
     with pytest.raises(ValueError,match='samples_per_patient'):
         validate_config(config)
+
+
+def test_load_frozen_checkpoint_rejects_split_and_patient_mismatch(tmp_path,config):
+    from types import SimpleNamespace
+    from experiments.seizure_preservation.checkpoints import load_patient_decoders
+    from experiments.seizure_preservation.common import write_json
+    config=copy.deepcopy(config)
+    config['decoders']=['GRU']
+    config['training']['device']='cpu'
+    config['training']['gru'].update(hidden_size=3,layers=1)
+    config['load_decoders']=str(tmp_path/'source')
+    source=tmp_path/'source'/'ID01'
+    destination=tmp_path/'destination'/'ID01'
+    manifest=dict(patient='ID01',native_fs=256,target_fs=1024,groups={'test':[1]},seizure_intervals_samples=[[2,3]])
+    fingerprint=dict(bytes=100,mtime_ns=2,channels=2,samples=2048,fs=256,annotations_sha256='abc')
+    for folder in (source,destination):
+        write_json(folder/'splits.json',manifest)
+        write_json(folder/'input_fingerprint.json',fingerprint)
+    (source/'signals').mkdir()
+    (source/'GRU').mkdir()
+    np.save(source/'signals/validation_labels.npy',[0,1])
+    model=build_model('GRU',2,2047,config)
+    saved=dict(model=model.state_dict(),decoder='GRU',channels=2,samples=2047,mean=torch.zeros(2),scale=torch.ones(2),
+               epoch=2,validation_loss=.3,config=config,seed=derived_seed(config['seed'],'ID01','GRU','training',0))
+    path=source/'GRU'/'best.pt'
+    torch.save(saved,path)
+    patient=SimpleNamespace(patient='ID01',channels=2)
+    models,norm,labels=load_patient_decoders(patient,config,destination)
+    assert not models['GRU'].training and not any(p.requires_grad for p in models['GRU'].parameters())
+    np.testing.assert_array_equal(norm[1],[1,1])
+    np.testing.assert_array_equal(labels,[0,1])
+    assert path.read_bytes()==(destination/'GRU'/'best.pt').read_bytes()
+    saved['seed']=derived_seed(config['seed'],'ID02','GRU','training',0)
+    torch.save(saved,path)
+    with pytest.raises(ValueError,match='different patient'):
+        load_patient_decoders(patient,config,destination)
+    manifest['groups']={'test':[2]}
+    write_json(destination/'splits.json',manifest)
+    with pytest.raises(ValueError,match='split mismatch'):
+        load_patient_decoders(patient,config,destination)
