@@ -61,7 +61,13 @@
     "ERAASR",
     "LRR",
     "linear_interpolation",
-    "template_subtraction"
+    "template_subtraction",
+    "svd_template_subtraction",
+    "window_ica",
+    "low_rank_tv",
+    "asar",
+    "dictionary_learning",
+    "pulse"
   ],
   "eegnet_source": "/home/jalali/seizure_detection/models/eegnet.py",
   "artifact_source": "/home/jalali/seizure_detection/utils/artifact_generator.py",
@@ -158,6 +164,23 @@
     },
     "lrr": {
       "calibration_windows": 16
+    },
+    "pulse": {
+      "checkpoint": "results/pulse_swec_synthetic/pulse_swec_synthetic.pt",
+      "checkpoints": {},
+      "device": "same_as_decoder",
+      "batch_size": 1
+    },
+    "method_overrides": {
+      "window_ica": {
+        "ica_components": 8
+      },
+      "low_rank_tv": {
+        "max_iters": 200
+      },
+      "asar": {
+        "asar_stats_samples": 500
+      }
     }
   },
   "restoration_epsilon": 1e-06,

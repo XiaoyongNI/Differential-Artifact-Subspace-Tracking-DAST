@@ -213,6 +213,47 @@ the same relative positions, without optimization. Short rest intervals under
 PYTHONPATH=tests:. python -m unittest benchmarks.test_pulse_nn benchmarks.test_methods benchmarks.test_metrics
 ```
 
+## Reusable SWEC synthetic PULSE checkpoint
+
+The SWEC-specific runner trains the neural PULSE method across stimulation
+sites and supports direct testing from a saved checkpoint:
+
+```bash
+# Training: all 16 sites represented, plus 2/4/8-site mixtures; 200 epochs.
+python -m benchmarks.train_pulse_swec --mode train --device cuda:1
+# Testing only: loads weights and normalization; no optimizer or refitting.
+python -m benchmarks.train_pulse_swec --mode test \
+  --checkpoint results/pulse_swec_synthetic/pulse_swec_synthetic.pt \
+  --stim-channels 0 1 2 8 --trials 16 17 18 19 \
+  --out-dir results/pulse_swec_test --device cuda:1
+```
+
+Available stimulation sites are `0 1 2 8 9 10 16 17 18 24 25 26 84 85 86 87`.
+The runner accepts **1–128 recording channels in their original order** and
+appends zero channels to train a **128-channel checkpoint**, at **10,240 Hz**.
+Evaluation pads to the checkpoint width and removes padding before computing
+metrics or saving outputs. The existing 20-trial split and stimulation-site
+configurations still apply. Use `--device cpu` if CUDA is unavailable. Source arrays are streamed
+once to `results/pulse_swec_cache` in float32, using the loader's stimulation
+crop. The checkpoint itself does not depend on that cache; this runner uses it
+to prepare later SWEC tests efficiently.
+
+Original trials 0–15 train; trials 16–19 are held out across every stimulation
+configuration. Each training trial contributes a distinct single-site example,
+a seeded 2/4/8-site mixture, and the default four-site configuration: 48 total.
+No clean targets enter training. Saved stimulation metadata reconstructs a
+normalized aggregate biphasic trace; it is not a measured trace. The spectral
+cutoff is set to 200 Hz for this SWEC run and the blending duration to 4 ms;
+other physics-loss weights and optimizer settings use the PULSE defaults.
+
+`training_manifest.json` records the split, exact configurations, settings,
+source identity, and checkpoint checksum. `training_log.csv` records progress.
+The checkpoint is atomically updated every 20 epochs and after training.
+`test_metrics.csv` evaluates every single site and two multi-site combinations
+on the untouched trials, using the **reloaded** checkpoint; ground truth is
+used only for these metrics. Direct test mode writes its selected configurations'
+cleaned signals to `test_outputs.npz`.
+
 ## Dictionary learning
 
 The implementation in `benchmarks/dictionary_learning.py` adapts the local

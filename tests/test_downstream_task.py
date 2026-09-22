@@ -132,6 +132,7 @@ def test_patient_paired_statistics_and_sample_sd(tmp_path,config):
 
 def test_all_cancellers_same_input_and_grid(config):
     config=copy.deepcopy(config)
+    config['cancellation']['method_overrides']['asar'] = {'asar_stats_samples':64}
     t=np.arange(256)/1024
     x=np.stack([np.sin(2*np.pi*(7+c)*t) for c in range(3)]).astype(np.float32)
     triggers=list(range(16,240,16))
@@ -140,7 +141,7 @@ def test_all_cancellers_same_input_and_grid(config):
     parameters=dict(stim_rate=64.,first_pulse_sample=16,period_samples=16,trigger_samples=triggers)
     from threadpoolctl import threadpool_limits
     with threadpool_limits(limits=1):
-        for method in config['methods'][2:]:
+        for method in (m for m in config['methods'][2:] if m != 'pulse'):
             y=apply_artifact_cancellation(x,method,parameters,config,lrr_weights=np.zeros((3,3)))
             assert y.shape==(3,255) and np.isfinite(y).all()
             np.testing.assert_array_equal(x,before)
@@ -313,3 +314,56 @@ def test_load_frozen_checkpoint_rejects_split_and_patient_mismatch(tmp_path,conf
     write_json(destination/'splits.json',manifest)
     with pytest.raises(ValueError,match='split mismatch'):
         load_patient_decoders(patient,config,destination)
+
+
+def test_all_benchmark_methods_are_enabled(config):
+    from benchmarks.methods import METHODS
+    mapped = [{'SVD':'window_svd','LRR':'lrr'}.get(m,m) for m in config['methods']]
+    assert set(METHODS) <= set(mapped)
+
+
+def test_pulse_checkpoint_shape_preflight(tmp_path,config):
+    from experiments.seizure_preservation.pulse_adapter import inspect_checkpoint
+    path=tmp_path/'pulse.pt'
+    torch.save(dict(model_config={'out_channels':88},training_config={'sampling_rate':10240}),path)
+    config['cancellation']['pulse']['checkpoint']=str(path)
+    info=inspect_checkpoint(config,'ID01',88)
+    assert info['checkpoint_fs']==10240
+    padded=inspect_checkpoint(config,'ID04',32)
+    assert padded['input_channels']==32 and padded['padded_channels']==56
+    with pytest.raises(ValueError,match='cannot be dropped'):
+        inspect_checkpoint(config,'ID05',128)
+
+
+def test_pulse_matched_trace_and_identity_resampling(config):
+    from types import SimpleNamespace
+    from experiments.seizure_preservation.pulse_adapter import apply_pulse_checkpoint, matched_trace
+    from benchmarks.methods import BenchmarkResult
+    x=np.random.default_rng(11).normal(size=(3,128)).astype(np.float32)
+    net=torch.nn.Linear(3,3).eval().requires_grad_(False)
+    net.out_channels=128
+    model=SimpleNamespace(fs=10240.,network=net)
+    params=dict(stim_channels=[0],stim_rate=64.,current=73.,pulse_frequency=250.,
+                first_pulse_sample=32,target_fs=1024,stim_end_seconds=.11)
+    def identity(raw,markers,fs,options,**kwargs):
+        assert fs==10240 and raw.shape==(1,128,1280)
+        assert np.all(raw[:,3:]==0)
+        trace=kwargs['stim_trace']
+        assert trace.shape==(1,1,1280)
+        assert markers[0]==320 and np.all(trace[:,:,:320]==0)
+        assert trace[0,0,320]==-1
+        return BenchmarkResult(raw.copy(),np.zeros_like(raw))
+    with patch('experiments.seizure_preservation.pulse_adapter.pulse',side_effect=identity):
+        result,trace=apply_pulse_checkpoint(x,params,config,model)
+    np.testing.assert_array_equal(result,x)
+    np.testing.assert_array_equal(trace,matched_trace(params,1280,10240))
+    with pytest.raises(ValueError,match='never automatic'):
+        apply_pulse_checkpoint(x,params,config,None)
+
+
+def test_subset_of_new_benchmarks(config):
+    config['methods'] = ['Clean', 'Contaminated', 'pulse', 'svd_template_subtraction']
+    validate_config(config)
+    config['methods'].remove('Clean')
+    with pytest.raises(ValueError, match='references are required'):
+        validate_config(config)

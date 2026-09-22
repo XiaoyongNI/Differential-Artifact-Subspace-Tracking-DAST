@@ -105,7 +105,8 @@ class PULSEModel:
     uncertainty_state: dict | None = None
 
 
-def fit_pulse(X_train, stim_trace, fs, config=None, progress=None):
+def fit_pulse(X_train, stim_trace, fs, config=None, progress=None,
+              checkpoint_path=None, checkpoint_every=20):
     """Train only on mixed recordings and stimulus traces, without clean labels.
 
     Whole trials are minibatch items, as in the upstream default train.py path.
@@ -113,6 +114,8 @@ def fit_pulse(X_train, stim_trace, fs, config=None, progress=None):
     receives (completed_epoch, total_epochs, mean_loss).
     """
     config = replace(config or BenchmarkConfig(method='pulse'))
+    if checkpoint_path is not None and (not isinstance(checkpoint_every, int) or checkpoint_every < 1):
+        raise ValueError('checkpoint_every must be positive')
     _validate_config(config, fs)
     x = _signal(X_train)
     trace = _trace(stim_trace, x.shape)
@@ -161,6 +164,9 @@ def fit_pulse(X_train, stim_trace, fs, config=None, progress=None):
             history.append({'total': total/len(loader), **{k: v/len(loader) for k, v in components.items()}})
             if progress is not None:
                 progress(epoch+1, config.pulse_epochs, history[-1]['total'])
+            if checkpoint_path is not None and ((epoch+1) % checkpoint_every == 0 or epoch+1 == config.pulse_epochs):
+                state = None if uncertainty is None else {k: v.detach().cpu() for k, v in uncertainty.state_dict().items()}
+                save_pulse(PULSEModel(network, mean, std, float(fs), config, history.copy(), state), checkpoint_path)
         network.eval()
         network.requires_grad_(False)
         state = None if uncertainty is None else {k: v.detach().cpu() for k, v in uncertainty.state_dict().items()}
@@ -227,7 +233,10 @@ def save_pulse(model, path):
     }
     if model.uncertainty_state is not None:
         payload['uncertainty_loss_state_dict'] = model.uncertainty_state
-    torch.save(payload, Path(path))
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix+'.tmp')
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def load_pulse(path, device='auto'):

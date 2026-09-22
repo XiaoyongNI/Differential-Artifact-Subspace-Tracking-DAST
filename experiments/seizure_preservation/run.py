@@ -46,8 +46,8 @@ def validate_config(c):
         raise ValueError('Seizure grouping margin must cover the nonnegative split guard')
     if c['two_seizure_policy'] not in ('negative_only_validation','error'):
         raise ValueError('Unknown two-seizure policy')
-    if not {'Clean','Contaminated','DAST','SVD','ERAASR'} <= set(c['methods']):
-        raise ValueError('The five primary conditions are required')
+    if not {'Clean','Contaminated'} <= set(c['methods']):
+        raise ValueError('Clean and Contaminated references are required for restoration ratios')
     if len(c['methods']) != len(set(c['methods'])) or any(m not in {'Clean','Contaminated','DAST','SVD','ERAASR','LRR',*METHODS} for m in c['methods']):
         raise ValueError('Unknown/duplicate cancellation method')
     if 'LRR' in c['methods'] or 'lrr' in c['methods']:
@@ -66,6 +66,16 @@ def validate_config(c):
     c['evaluation_offset_samples'] = dast.derivative_order
     if round(c['window_seconds']*1024)-dast.derivative_order < 32:
         raise ValueError('Window too short for the decoder architectures')
+    for method, overrides in c['cancellation'].get('method_overrides', {}).items():
+        if method not in METHODS:
+            raise ValueError(f'Unknown method override: {method}')
+        settings = dict(c['cancellation']['baseline'])
+        settings.update(overrides)
+        BenchmarkConfig(**settings)
+    if 'pulse' in c['methods']:
+        options = c['cancellation']['pulse']
+        if not options['checkpoint'] or not isinstance(options['batch_size'],int) or options['batch_size'] < 1:
+            raise ValueError('PULSE requires a checkpoint and positive batch size')
     baseline = BenchmarkConfig(**c['cancellation']['baseline'])
     if baseline.template_history is None or baseline.template_history < 1:
         raise ValueError('Use backward template subtraction; no clean/test reference template fitting')
@@ -103,6 +113,7 @@ def source_manifest(config):
     paths = list(Path(__file__).parent.glob('*.py')) + [project/p for p in (
         'algorithms.py','pipeline.py','covariance.py','data_loading.py','plotting.py','utils.py',
         'benchmarks/methods.py','benchmarks/lrr.py','benchmarks/_pulse_low_rank_tv.py')]
+    paths += [p for p in (project/'benchmarks').glob('*.py') if not p.name.startswith('test_') and p not in paths]
     paths += [Path(config['eegnet_source']), Path(config['artifact_source'])]
     return {str(p.resolve()):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
@@ -173,6 +184,10 @@ def run_patient(patient_id, config, directory):
     np.savez(directory/'normalization.npz',mean=mean,scale=scale,fitted_on='clean_train_only',offset=offset)
     train_rms = float(np.sqrt(np.mean(mean.astype(float)**2+scale.astype(float)**2)))
     # Decoder selection is complete before any test artifact is generated.
+    pulse_model = None
+    if 'pulse' in config['methods']:
+        from .pulse_adapter import prepare_pulse
+        pulse_model = prepare_pulse(config,patient.patient,patient.channels,directory)
     lrr_weights = None
     if any(m in config["methods"] for m in ("LRR", "lrr")):
         lrr_weights = calibrate_lrr(test_x.shape[1], test_x.shape[2], train_rms,
@@ -180,6 +195,10 @@ def run_patient(patient_id, config, directory):
     shape = test_x.shape
     mixed = np.lib.format.open_memmap(cache/'Contaminated.npy',mode='w+',dtype=np.float32,shape=shape)
     artifacts = np.lib.format.open_memmap(cache/'artifact.npy',mode='w+',dtype=np.float32,shape=shape)
+    pulse_traces = None
+    if pulse_model is not None:
+        pulse_traces = np.lib.format.open_memmap(directory/'pulse_stim_traces.npy',mode='w+',dtype=np.float32,
+            shape=(shape[0],1,int(np.ceil(shape[2]*pulse_model.fs/config['target_fs']))))
     methods = [m for m in config['methods'] if m not in ('Clean','Contaminated')]
     outputs = {m:np.lib.format.open_memmap(cache/f'{m}.npy',mode='w+',dtype=np.float32,
         shape=(shape[0],shape[1],shape[2]-offset)) for m in methods}
@@ -190,8 +209,11 @@ def run_patient(patient_id, config, directory):
             mixed[i], artifacts[i] = contaminated,artifact
             contaminated.flags.writeable = False
             input_hash = array_sha256(contaminated)
+            if pulse_traces is not None:
+                from .pulse_adapter import matched_trace
+                pulse_traces[i] = matched_trace(params,pulse_traces.shape[-1],pulse_model.fs)
             for method in methods:
-                outputs[method][i] = apply_artifact_cancellation(contaminated,method,params,config,lrr_weights=lrr_weights)
+                outputs[method][i] = apply_artifact_cancellation(contaminated,method,params,config,lrr_weights=lrr_weights,pulse_model=pulse_model)
                 if array_sha256(contaminated) != input_hash:
                     raise RuntimeError(f'{method} modified shared contaminated input')
             provenance.write(json.dumps(dict(window=i,**params,clean_sha256=array_sha256(clean),
@@ -199,6 +221,8 @@ def run_patient(patient_id, config, directory):
             if i % 50 == 0 or i==len(test_x)-1:
                 print(f'{patient.patient}: matched cancellation {i+1}/{len(test_x)}',flush=True)
     mixed.flush(); artifacts.flush()
+    if pulse_traces is not None:
+        pulse_traces.flush()
     for x in outputs.values():
         x.flush()
     rows = []
@@ -214,7 +238,7 @@ def run_patient(patient_id, config, directory):
                 window_indices=np.arange(len(test_y)), sample_offset=offset, sampling_rate=config['target_fs'])
     add_restoration(rows,config['restoration_epsilon'])
     write_csv(directory/'results.csv',rows)
-    del test_x,mixed,artifacts,outputs,models,x,clean
+    del test_x,mixed,artifacts,outputs,models,x,clean,pulse_model,pulse_traces
     # Remove only regenerable caches created in this patient directory.
     for path in cache.glob('*.npy'):
         remove = (path.name.endswith('_clean.npy') and not config['storage']['keep_clean_windows'])
@@ -244,6 +268,10 @@ def run(config, resume=False, plan_only=False):
             for name in config['decoders']:
                 path = Path(config['load_decoders'])/f'ID{patient_id:02d}'/name/'best.pt'
                 config['loaded_checkpoint_hashes'][str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if 'pulse' in config['methods'] and not plan_only:
+        from .pulse_adapter import inspect_checkpoint
+        config['pulse_checkpoint_inputs'] = {f'ID{pid:02d}': inspect_checkpoint(
+            config,f'ID{pid:02d}',load_patient_data(pid,config).channels) for pid in config['patients']}
     exact = dict(config, plan_only=plan_only)
     sources = source_manifest(config)
     config_file = directory/'config.json'
@@ -300,6 +328,8 @@ def main():
     parser.add_argument('--output-dir',type=Path)
     parser.add_argument('--load-decoders',type=Path,help='Prior run directory: reuse frozen best.pt checkpoints; skip decoder training')
     parser.add_argument('--patients',nargs='+',type=int)
+    parser.add_argument('--methods',nargs='+',help='Explicit condition list; include Clean Contaminated for restoration ratios')
+    parser.add_argument('--pulse-checkpoint',type=Path,help='Frozen PULSE checkpoint; never trains PULSE')
     parser.add_argument('--samples-per-patient',type=int,help='Total window budget per patient across train/validation/test; >=6. Overrides class caps, targets balanced classes.')
     parser.add_argument('--device',choices=['auto','cpu','cuda','cuda:0','cuda:1'])
     parser.add_argument('--resume',action='store_true',help='Skip finished patients only; partial patients restart')
@@ -332,6 +362,10 @@ def main():
         config['patients'] = args.patients
     if args.samples_per_patient is not None:
         config['samples_per_patient'] = args.samples_per_patient
+    if args.methods is not None:
+        config['methods'] = args.methods
+    if args.pulse_checkpoint is not None:
+        config['cancellation']['pulse']['checkpoint'] = str(args.pulse_checkpoint.resolve())
     if args.device is not None:
         config['training']['device'] = args.device
     from threadpoolctl import threadpool_limits

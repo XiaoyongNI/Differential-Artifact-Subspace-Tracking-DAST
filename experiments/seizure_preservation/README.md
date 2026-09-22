@@ -15,11 +15,12 @@ already supplies these dependencies. Tests additionally use pytest.
 python -m experiments.seizure_preservation.run --plan-only \
   --output-dir results/seizure_preservation_plan
 
-# Real ID04 data, all three decoders and eight conditions, tiny one-epoch check.
+# Real ID04 data, all three decoders and the configured conditions, tiny one-epoch check.
 # These are integration-test outputs, NOT scientific performance estimates.
-python -m experiments.seizure_preservation.run --smoke --device cpu
+python -m experiments.seizure_preservation.run --smoke --patients 1 --device cpu
 
-# Full experiment: 18 patients, clean validation checkpoint/LR selection.
+# Full experiment: requires compatible PULSE checkpoints for all selected patients.
+# See the checkpoint compatibility section below.
 python -m experiments.seizure_preservation.run --device cuda:0
 
 # Resume after interruption; finished patients are skipped, partial ones restart.
@@ -77,6 +78,57 @@ All settings are in [config.json](config.json). CLI overrides and smoke override
 are saved in the exact run configuration. Choose a new output directory when
 changing configuration or code; resume verifies both configuration and source
 hashes. The output directory must be dedicated to this experiment.
+
+## All benchmarks and PULSE checkpoint compatibility
+
+The default list now enables every registered benchmark: hybrid
+`svd_template_subtraction`, `window_ica`, `low_rank_tv`, `asar`,
+`dictionary_learning`, and `pulse`, plus the existing conditions. Registry
+names are retained in CSVs. `cancellation.method_overrides` supplies per-method
+settings over the common `baseline` settings. Dictionary learning requires
+`hdbscan` (available in the current environment). ICA can report convergence
+warnings on short pulse windows; its output is still evaluated as reported by
+the existing benchmark. LowRankTV and the neural PULSE method are distinct.
+ASAR uses its existing test-prefix calibration/replay convention; dictionary
+learning fits templates from the current contaminated window, without clean
+signals or labels. These are offline baseline comparisons.
+
+**PULSE is inference-only:** `fit_pulse` is never called. The default checkpoint
+is `results/pulse_swec_synthetic/pulse_swec_synthetic.pt`. The new checkpoint
+supports up to **128 channels at 10,240 Hz**. The adapter reuses the training
+code's `pad_channels` to append zero channels, preserving patient channel order.
+It resamples the same contaminated signal to the checkpoint rate, runs frozen
+inference, keeps only the original channels of the predicted correction, and
+resamples that correction back to the common 1,024 Hz grid. Decoder inputs
+remain at 1,024 Hz throughout. No checkpoint normalization is refitted.
+Patients exceeding the checkpoint channel count are rejected, never truncated.
+Padding and checkpoint provenance are saved in each patient's `pulse_checkpoint.json`.
+
+Run every benchmark with previously trained seizure decoders:
+
+```bash
+python -m experiments.seizure_preservation.run --device cuda:0 \
+  --load-decoders results/seizure_preservation_with_lrr \
+  --pulse-checkpoint results/pulse_swec_synthetic/pulse_swec_synthetic.pt \
+  --output-dir results/seizure_preservation_all_benchmarks
+```
+
+`--pulse-checkpoint PATH` overrides the default path. The decoder source run's
+splits and window-selection settings are inherited. Neither PULSE nor the
+seizure decoders are trained in this mode.
+
+
+**Stimulation trace:** the original synthetic NPZ contains pulse parameters,
+not a stored trace array. `benchmarks.train_pulse_swec.stimulation_trace` is now
+shared between PULSE's original synthetic-data loader and this experiment.
+It reconstructs the normalized biphasic waveform from rate, current, pulse
+frequency, onset, and end. For each new test artifact the adapter uses that
+artifact's exact saved parameters, rather than loading an unrelated 129 Hz
+waveform from the older dataset. This keeps PULSE's trace matched to the same
+contaminated samples received by every canceller. The trace is saved in
+`IDxx/pulse_stim_traces.npy` at the checkpoint sampling rate. Checkpoint path,
+SHA-256, rate conversion, and trace provenance are in `pulse_checkpoint.json`.
+Source snapshots now include every benchmark implementation used by the run.
 
 ## Splits, sampling, and labels
 
@@ -175,6 +227,12 @@ seeds, triggers and clean/artifact/contaminated hashes are saved per window.
 | DAST | Existing derivative-driven PASTd pipeline, default rank 1; per-window state reset, normalized tracking and denormalized output |
 | SVD | Existing `benchmarks.methods.window_svd`, centered spatial SVD in merged known pulse windows |
 | ERAASR | New explicit **single-trial Python adaptation**: sequential channel then pulse PCA regression, with continuity reconstruction |
+| SVD + template | Existing `svd_template_subtraction` (SVD followed by backward template subtraction) |
+| ICA | Existing `window_ica` |
+| LowRankTV | Existing `low_rank_tv` solver |
+| ASAR | Existing adaptive reference, with test-prefix calibration |
+| Dictionary learning | Existing contaminated-window template clustering |
+| PULSE | Frozen pretrained U-Net, with matched stimulation trace; channel compatibility required |
 | LRR | Existing `fit_lrr_trials` and fixed-weight, sample-by-sample `lrr` benchmark |
 | linear_interpolation | Existing benchmark implementation using known pulse markers |
 | template_subtraction | Existing backward template implementation using the previous three contaminated pulse epochs |
@@ -193,7 +251,8 @@ seeds, pulse-window settings, and hashes. LRR is included automatically in
 restoration metrics, patient aggregates, figures, and Holm-corrected DAST-versus-LRR
 comparisons. Use a new output directory when adding LRR to an older run.
 
-The existing `window_ica`, `pulse`/`low_rank_tv` are optional entries in `methods`.
+`window_ica`, `pulse`, `low_rank_tv`, `svd_template_subtraction`, `asar`, and
+`dictionary_learning` are now enabled in the default `methods` list.
 Parameters are fixed before test evaluation. Known synthetic pulse markers are
 available to windowed methods, representing an oracle-timing comparison.
 
@@ -250,3 +309,9 @@ cached 1024 Hz signals, and full continuous-window extraction is much larger.
 Use the full run for scientific results. A smoke run exercises all paths but has
 one epoch, reduced architectures, 16 training and 8 test windows on one patient;
 its saved config and completion marker explicitly identify it as a smoke test.
+
+To evaluate only new cancellers, add
+`--methods Clean Contaminated pulse svd_template_subtraction low_rank_tv asar dictionary_learning`.
+Clean and Contaminated are required restoration references; other methods are optional.
+This produces a separate subset report, not a merge with the source run. Without
+DAST rows, paired DAST comparisons have zero pairs and NaN p-values.

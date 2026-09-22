@@ -161,7 +161,7 @@ def eraasr_single_trial(x, parameters, options):
     return cleaned
 
 
-def apply_artifact_cancellation(contaminated, method, parameters, config, lrr_weights=None):
+def apply_artifact_cancellation(contaminated, method, parameters, config, lrr_weights=None, pulse_model=None):
     """No access to clean test signals or seizure labels; fixed parameters.
 
     Every method returns the common decoder grid, cropped by the DAST finite
@@ -174,11 +174,17 @@ def apply_artifact_cancellation(contaminated, method, parameters, config, lrr_we
     if method == 'DAST':
         result = run_pipeline(dataset, PipelineConfig(n_test=0, **config['cancellation']['dast']))
         output = result.stages['cleaned'][0]
+    elif method == 'pulse':
+        from .pulse_adapter import apply_pulse_checkpoint
+        output, _ = apply_pulse_checkpoint(x,parameters,config,pulse_model)
+        output = output[:, offset:]
     elif method == 'ERAASR':
         output = eraasr_single_trial(x, parameters, config['cancellation']['eraasr'])[:, offset:]
     else:
         mapped = {'SVD':'window_svd', 'LRR':'lrr'}.get(method, method)
-        baseline = BenchmarkConfig(method=mapped, **config['cancellation']['baseline'])
+        settings = dict(config['cancellation']['baseline'])
+        settings.update(config['cancellation'].get('method_overrides', {}).get(method, {}))
+        baseline = BenchmarkConfig(method=mapped, **settings)
         kwargs = {'W': lrr_weights} if mapped == 'lrr' else {}
         output = run_benchmark(dataset, baseline, parameters['trigger_samples'], **kwargs).cleaned[0, :, offset:]
     if output.shape != (x.shape[0], x.shape[1]-offset) or not np.isfinite(output).all():
