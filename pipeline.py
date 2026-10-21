@@ -14,6 +14,7 @@ from algorithms import (
     apply_bpf_3d,
     apply_lpf_3d,
     choose_k_from_delta_ema,
+    choose_k_from_stability_gap,
     covariance_aware_subspace_suppression,
     denormalize_channels,
     derivative_time,
@@ -45,6 +46,11 @@ class PipelineConfig:
     adaptive_k: bool = False
     adaptive_k_threshold: float = 0.1
     adaptive_k_check_period: int = 100
+    # 'relative': (ema_j - ema_1)/(1-beta) < threshold; 'stability_gap': largest
+    # jump in log instability (threshold unused), EMA excludes the first update.
+    adaptive_k_rule: str = "relative"
+    # Causal SVD initialization: track from the canonical start for the first
+    # warm_start_samples samples, then re-initialize from their SVD (0 disables).
     warm_start_samples: int = 0
     carry_tracker_across_trials: bool = False
     harmonic_filter: bool = False
@@ -91,6 +97,8 @@ def _select_test_trials(X: np.ndarray, y_clean: Optional[np.ndarray], n_test: Op
 def run_pipeline(dataset: Dataset, config: PipelineConfig, stim_times=None) -> PipelineResult:
     if config.removal_method not in ("projection", "covariance"):
         raise ValueError("removal_method must be projection or covariance")
+    if config.adaptive_k_rule not in ("relative", "stability_gap"):
+        raise ValueError("adaptive_k_rule must be relative or stability_gap")
     X_raw, y_clean = _select_test_trials(dataset.X, dataset.y_clean, config.n_test)
     fs = float(dataset.fs)
     stages: Dict[str, np.ndarray] = {"raw": X_raw}
@@ -152,22 +160,48 @@ def run_pipeline(dataset: Dataset, config: PipelineConfig, stim_times=None) -> P
                 neural_initial[tr] = Rn
         if tracker is None or not config.carry_tracker_across_trials:
             tracker = _make_tracker(config, n_channels)
-            if config.warm_start_samples > 0:
-                n_warm = min(config.warm_start_samples, X_track.shape[-1])
-                tracker.warm_start(X_track[tr, :, :n_warm])
+            warm_at = config.warm_start_samples if 0 < config.warm_start_samples < n_steps else None
             active_k = 1 if config.adaptive_k else config.rank
+            # Instability EMA for the stability-gap rule; skips the first update,
+            # the deterministic jump away from the canonical initialization.
+            gap_ema = np.zeros(config.rank)
+            ema_start = 0
+        else:
+            ema_start = 0  # carried tracker: statistics continue across trials
         for t in range(n_steps):
+            if warm_at is not None and t == warm_at:
+                # Samples 0..t-1 have already arrived: re-initialize causally and
+                # restart the instability statistics from the new basis.
+                tracker.warm_start(X_track[tr, :, :t])
+                if isinstance(tracker, PASTd):
+                    tracker.delta_u_ema[:] = 0.0
+                gap_ema = np.zeros(config.rank)
+                ema_start = t
+                warm_at = None
             y = tracker.update(X_track[tr, :, t], project_x=X_project[tr, :, t], track_delta=True) if isinstance(tracker, PASTd) else tracker.update(X_track[tr, :, t], project_x=X_project[tr, :, t])
             if isinstance(tracker, PASTd):
                 delta_u[tr, t] = tracker.delta_u
                 delta_u_ema[tr, t] = tracker.delta_u_ema
+                if t > ema_start:
+                    gap_ema = config.beta * gap_ema + (1.0 - config.beta) * tracker.delta_u
                 if config.adaptive_k and t > 0 and t % config.adaptive_k_check_period == 0:
-                    active_k = choose_k_from_delta_ema(tracker.delta_u_ema, config.beta, config.adaptive_k_threshold)
+                    if config.adaptive_k_rule == "stability_gap":
+                        if t > ema_start + 1:
+                            active_k = choose_k_from_stability_gap(gap_ema)
+                    else:
+                        active_k = choose_k_from_delta_ema(tracker.delta_u_ema, config.beta, config.adaptive_k_threshold)
             U = tracker.get_components()
             chosen_k[tr, t] = active_k
             u_trace[tr, t] = U
             if neural_cov is None:
-                X_past[tr, :, t] = X_project[tr, :, t] - U[:, :active_k] @ y[:active_k]
+                # Orthogonal projection onto the current tracked basis
+                # (Algorithm 1); QR keeps nested prefixes, so k selects them.
+                x_t = X_project[tr, :, t]
+                if active_k > 0:
+                    Q = np.linalg.qr(U[:, :active_k])[0]
+                    X_past[tr, :, t] = x_t - Q @ (Q.T @ x_t)
+                else:
+                    X_past[tr, :, t] = x_t
             else:
                 x_t = X_project[tr, :, t]
                 Rx = config.covariance_beta * Rx + (1.0 - config.covariance_beta) * np.outer(x_t, x_t)

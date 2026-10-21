@@ -2,12 +2,15 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 handles = [
-    Line2D([0], [0], color="0.18", linestyle="--", linewidth=1.2,
-           label="Reference"),
-    Line2D([0], [0], color="#D55E00", linestyle="--", linewidth=1.2,
-           label="Without time differentiation"),
-    Line2D([0], [0], color="#0072B2", linestyle="-", linewidth=1.2,
-           label="1st-order differentiation"),
+    # Line2D([0], [0], color="0.18", linestyle="--", linewidth=1.2,
+    #        label="Reference"),
+    # Line2D([0], [0], color="#D55E00", linestyle="--", linewidth=1.2,
+    #        label="No diff."),
+    # Line2D([0], [0], color="#0072B2", linestyle="-", linewidth=1.2,
+    #        label="1st-order differentiation"),
+    Line2D([0], [0], color="0.18", linestyle="--", linewidth=1.2, label="Reference"),
+    Line2D([0], [0], color="#D55E00", linestyle="--", linewidth=1.2, label="Noisy signal"),
+    Line2D([0], [0], color="#0072B2", linestyle="-", linewidth=1.2, label="DAST"),
 ]
 
 fig = plt.figure(figsize=(5.5, 0.28))

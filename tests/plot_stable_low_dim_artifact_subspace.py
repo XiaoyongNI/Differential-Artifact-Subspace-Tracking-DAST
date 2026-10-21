@@ -279,7 +279,7 @@ def plot_artifact_subspace_analysis(
         if not rows:
             continue
         trials = sum(r["trials"] for r in rows)
-        legend_label = f"{label} ({trials} {'trial' if trials == 1 else 'trials'})"
+        legend_label = f"{label}" # ({trials} {'trial' if trials == 1 else 'trials'})
         # Do not extend curves beyond a recording's available spatial rank.
         maxrank = max(len(r["curve"]) for r in rows)
         curves = np.full((len(rows), maxrank), np.nan)
@@ -299,7 +299,7 @@ def plot_artifact_subspace_analysis(
                         label=legend_label if i == 0 else "_nolegend_")
     axes[0].set_xlim(1, max(4, max_plot_rank))
     axes[0].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
-    axes[0].axhline(.95, color=".65", ls=":", lw=.6)
+    # axes[0].axhline(.95, color=".65", ls=":", lw=.6)
     # Show the actual early-rank variation of the displayed curves.
     finite_lows = np.asarray(zoom_lows)[np.isfinite(zoom_lows)]
     lower = float(finite_lows.min()) if len(finite_lows) else .8
@@ -313,8 +313,8 @@ def plot_artifact_subspace_analysis(
         spine.set_visible(True)
         spine.set_color(".3")
         spine.set_linewidth(.8)
-    if zoom.get_ylim()[0] <= .95:
-        zoom.axhline(.95, color=".65", ls=":", lw=.6)
+    # if zoom.get_ylim()[0] <= .95:
+    #     zoom.axhline(.95, color=".65", ls=":", lw=.6)
     for (fig, ax), (suffix, xlabel, ylabel) in zip(figures, panels):
         ax.set(xlabel=xlabel, ylabel=ylabel, ylim=(0, 1.025))
         if ax is not axes[0]:
@@ -353,7 +353,8 @@ def main():
     parser.add_argument("--out-dir", default=Path("plots/stable_low_dim_artifact_subspace"), type=Path) 
     parser.add_argument("--datasets", nargs="+", choices=["synthetic", "pbs", "eraasr", "dictionary"], default=["synthetic", "pbs", "eraasr", "dictionary"])
     parser.add_argument("--stim-channels", type=int, nargs="+", default=[0, 1, 2, 8, 9,10,16,17,18,24,25,26,84,85,86,87])
-    parser.add_argument("--pbs-configurations", type=int, nargs="+", default=list(range(14)))
+    parser.add_argument("--pbs-configurations", type=int, nargs="+", default=list(range(13)),
+                        help="Config 13 (no stimulation) is excluded by default")
     parser.add_argument("--dictionary-configurations", nargs="+", choices=["2", "4", "5", "14"], default=["2", "14"])
     parser.add_argument("--normalization", choices=["global_per_channel", "none"], default="global_per_channel")
     parser.add_argument("--skip-unnormalized", action="store_true")

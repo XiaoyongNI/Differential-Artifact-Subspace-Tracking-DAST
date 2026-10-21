@@ -12,6 +12,7 @@ data/
 plots/
 paper/
 results/
+figures/
 *.pth
 *.pt
 

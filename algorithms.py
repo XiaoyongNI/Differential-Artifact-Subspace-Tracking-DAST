@@ -180,9 +180,14 @@ class PASTd:
         self.delta_u_ema = np.zeros(self.rank)
 
     def warm_start(self, X_init: np.ndarray):
+        """Initialize from the SVD of already received samples (channels x W).
+
+        d is the projected energy summed over the W samples, matching the
+        recursion d = beta * d + y**2 for W much shorter than 1 / (1 - beta).
+        """
         U, S, _ = np.linalg.svd(X_init, full_matrices=False)
-        self.U = U[:, :self.rank]
-        self.d = (S[:self.rank] ** 2) / max(X_init.shape[1], 1)
+        self.U = U[:, :self.rank].copy()
+        self.d = np.maximum(S[:self.rank] ** 2, np.finfo(float).tiny)
 
     def update(self, update_x: np.ndarray, project_x: Optional[np.ndarray] = None, track_delta: bool = True):
         update_x = np.asarray(update_x, dtype=float).ravel()
@@ -264,6 +269,22 @@ def choose_k_from_delta_ema(delta_u_ema: np.ndarray, beta: float, threshold: flo
         else:
             break
     return chosen
+
+
+def choose_k_from_stability_gap(instability: np.ndarray) -> int:
+    """Artifact dimension at the largest jump in log instability.
+
+    instability: moving average of ||u_j(t) - u_j(t-1)|| for the tracked
+    components, in PASTd order. Artifact-dominated directions span a stable
+    subspace and fluctuate far less than neural-dominated ones, so k is placed
+    where consecutive components differ most in log instability. Scale-free:
+    common factors such as (1 - beta) or EMA bias correction cancel.
+    """
+    s = np.asarray(instability, dtype=float).ravel()
+    if s.size < 2:
+        return 1
+    s = np.maximum(s, np.finfo(float).tiny)
+    return int(np.argmax(np.diff(np.log(s)))) + 1
 
 
 def project_and_remove(x: np.ndarray, U: np.ndarray, rank: Optional[int] = None) -> np.ndarray:
